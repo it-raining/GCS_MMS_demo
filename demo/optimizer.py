@@ -16,15 +16,36 @@ Solvers: CasADi + IPOPT
 """
 
 import numpy as np
-from typing import List, Dict, Tuple, Optional, Callable
+from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass, field
 import casadi as ca
 import time
 
 from graph_builder import RegionGraph, SOURCE, TARGET
-from dynamics import (DynamicsModel, ControlParameterization,
-                      create_casadi_integrator, create_casadi_trajectory_sampler)
-from shooting import create_casadi_local_cost
+from graph_types import (
+    is_terminal_node_id,
+    region_index_from_node_id,
+    region_node_label,
+)
+from dynamics import (
+    CasADiIntegrationBundle,
+    DynamicsModel,
+    ControlParameterization,
+    create_integration_bundle,
+)
+from constraint_layers import (
+    build_activation_constraints,
+    build_fixed_path_boundary_constraints,
+    build_fixed_path_cbf_safety_constraints,
+    build_fixed_path_coupling_constraints,
+    build_fixed_path_geometry_constraints,
+    build_integrated_coupling_constraints,
+    build_integrated_dynamics_constraints,
+    build_integrated_geometry_constraints,
+    build_network_flow_constraints,
+    merge_constraint_layers,
+    stack_constraints,
+)
 
 
 @dataclass
@@ -35,23 +56,19 @@ class OptimizationConfig:
     w_L: float = 1.0     # Velocity/path length penalty
     w_E: float = 1.0     # Control effort penalty
     w_u_smooth: float = 0.2  # Penalty on control changes across segments
+    w_theta_smooth: float = 0.0  # Penalty on interface heading mismatch
     
     # Shooting parameters
     n_integration_steps: int = 20
     n_mesh_points: int = 5
     n_control_segments: int = 2
     safety_margin: float = 0.02
+    cbf_alpha: float = 0.0
     boundary_tolerance: float = 1e-8
     
     # Time bounds
     delta_min: float = 0.1
     delta_max: float = 10.0
-    
-    # Control bounds (unicycle)
-    v_min: float = -2.0
-    v_max: float = 2.0
-    omega_min: float = -np.pi
-    omega_max: float = np.pi
     
     # Big-M values
     M_position: float = 20.0
@@ -101,7 +118,8 @@ def _compute_connection_gap(path_regions: List[int],
                             entry_states: Dict[int, np.ndarray],
                             exit_states: Dict[int, np.ndarray],
                             start_state: np.ndarray,
-                            goal_state: np.ndarray) -> float:
+                            goal_state: np.ndarray,
+                            position_indices: Tuple[int, ...] = (0, 1)) -> float:
     """
     Maximum 2D position jump across start, interfaces, and goal.
 
@@ -111,14 +129,21 @@ def _compute_connection_gap(path_regions: List[int],
         return 0.0
 
     gaps = [
-        np.linalg.norm(entry_states[path_regions[0]][:2] - start_state[:2]),
-        np.linalg.norm(exit_states[path_regions[-1]][:2] - goal_state[:2]),
+        np.linalg.norm(
+            entry_states[path_regions[0]][list(position_indices)] -
+            start_state[list(position_indices)]
+        ),
+        np.linalg.norm(
+            exit_states[path_regions[-1]][list(position_indices)] -
+            goal_state[list(position_indices)]
+        ),
     ]
 
     for left_region, right_region in zip(path_regions[:-1], path_regions[1:]):
         gaps.append(
             np.linalg.norm(
-                exit_states[left_region][:2] - entry_states[right_region][:2]
+                exit_states[left_region][list(position_indices)] -
+                entry_states[right_region][list(position_indices)]
             )
         )
 
@@ -159,13 +184,6 @@ def _compute_bound_violation(g_val: np.ndarray,
     return float(max(np.max(low_viol), np.max(high_viol)))
 
 
-def _interior_mesh_indices(n_mesh: int) -> range:
-    """Return mesh indices that exclude the segment endpoints."""
-    if n_mesh <= 2:
-        return range(0)
-    return range(1, n_mesh - 1)
-
-
 def _get_graph_edge_anchor(graph: RegionGraph,
                            edge: Tuple[str, str],
                            start_state: np.ndarray,
@@ -187,6 +205,32 @@ def _get_graph_edge_anchor(graph: RegionGraph,
     return 0.5 * (u_centroid + v_centroid)
 
 
+def _state_guess_from_position(dynamics: DynamicsModel,
+                               position: np.ndarray,
+                               heading: float,
+                               warm_state: Optional[np.ndarray] = None) -> np.ndarray:
+    """Build a state initial guess from a 2D graph anchor."""
+    if warm_state is not None:
+        state = np.asarray(warm_state, dtype=np.float64).copy()
+        if state.size != dynamics.n_x:
+            state = np.zeros(dynamics.n_x, dtype=np.float64)
+    else:
+        state = np.zeros(dynamics.n_x, dtype=np.float64)
+
+    for local_idx, state_idx in enumerate(dynamics.position_indices):
+        state[state_idx] = position[local_idx]
+    for state_idx in dynamics.angle_indices:
+        state[state_idx] = heading
+
+    return state
+
+
+def _tile_control_vector(control: np.ndarray,
+                         control_param: ControlParameterization) -> np.ndarray:
+    """Repeat one control vector across all parameterization segments."""
+    return np.tile(np.asarray(control, dtype=np.float64), control_param.n_segments)
+
+
 class PathNLPSolver:
     """
     NLP solver for a fixed discrete path.
@@ -200,7 +244,9 @@ class PathNLPSolver:
     """
     
     def __init__(self, graph: RegionGraph, dynamics: DynamicsModel,
-                 config: OptimizationConfig):
+                 config: OptimizationConfig,
+                 control_param: Optional[ControlParameterization] = None,
+                 integration_bundle: Optional[CasADiIntegrationBundle] = None):
         """
         Args:
             graph: RegionGraph object
@@ -212,25 +258,22 @@ class PathNLPSolver:
         self.config = config
         
         # Control parameterization
-        self.control_param = ControlParameterization(
+        self.control_param = control_param or ControlParameterization(
             n_u=dynamics.n_u,
             parameterization="piecewise_constant",
             n_segments=config.n_control_segments
         )
-        
-        # Create CasADi functions
-        self.F_endpoint = create_casadi_integrator(
-            dynamics, self.control_param, config.n_integration_steps
+
+        self.integration_bundle = integration_bundle or create_integration_bundle(
+            dynamics,
+            self.control_param,
+            config.n_integration_steps,
+            config.n_mesh_points,
         )
-        
-        self.mesh_sampler = create_casadi_trajectory_sampler(
-            dynamics, self.control_param,
-            config.n_integration_steps, config.n_mesh_points
-        )
-        
-        self.local_cost_fn = create_casadi_local_cost(
-            dynamics, self.control_param, config.n_integration_steps
-        )
+        self.F_endpoint = self.integration_bundle.F_endpoint
+        self.mesh_sampler = self.integration_bundle.mesh_sampler
+        self.cbf_sampler = self.integration_bundle.cbf_sampler
+        self.local_cost_fn = self.integration_bundle.local_cost_fn
 
         if graph.regions:
             all_vertices = np.vstack([region.vertices for region in graph.regions])
@@ -251,10 +294,28 @@ class PathNLPSolver:
         else:
             self.position_lb = np.array([-1e-6, -1e-6], dtype=np.float64)
             self.position_ub = np.array([1e-6, 1e-6], dtype=np.float64)
+
+        self.state_lb, self.state_ub = dynamics.state_bounds(
+            self.position_lb,
+            self.position_ub,
+        )
+        self.control_lb, self.control_ub = dynamics.control_bounds()
+        self.w_lb = _tile_control_vector(self.control_lb, self.control_param)
+        self.w_ub = _tile_control_vector(self.control_ub, self.control_param)
+        self.nominal_w = _tile_control_vector(
+            dynamics.nominal_control(),
+            self.control_param,
+        )
+        self.speed_guess_scale = (
+            max(abs(float(self.control_lb[0])), abs(float(self.control_ub[0])), 1e-6)
+            if self.control_lb.size
+            else 1e-6
+        )
     
     def solve_path(self, path: List[str], start_state: np.ndarray,
                    goal_state: np.ndarray,
-                   warm_start: Optional[Dict[int, Dict[str, np.ndarray | float]]] = None
+                   warm_start: Optional[Dict[int, Dict[str, np.ndarray | float]]] = None,
+                   iteration_recorder=None,
                    ) -> OptimizationResult:
         """
         Solve NLP for a fixed path.
@@ -270,9 +331,8 @@ class PathNLPSolver:
         # Extract region sequence (excluding source/target)
         path_regions = []
         for node_id in path:
-            if node_id not in [SOURCE, TARGET]:
-                idx = int(node_id[1:])
-                path_regions.append(idx)
+            if not is_terminal_node_id(node_id):
+                path_regions.append(region_index_from_node_id(node_id))
         
         n_regions = len(path_regions)
         
@@ -288,7 +348,11 @@ class PathNLPSolver:
         
         try:
             result = self._build_and_solve_nlp(
-                path_regions, start_state, goal_state, warm_start=warm_start
+                path_regions,
+                start_state,
+                goal_state,
+                warm_start=warm_start,
+                iteration_recorder=iteration_recorder,
             )
             result.path = path
             result.solve_time = time.time() - start_time
@@ -305,7 +369,8 @@ class PathNLPSolver:
     def _build_and_solve_nlp(self, path_regions: List[int],
                              start_state: np.ndarray,
                              goal_state: np.ndarray,
-                             warm_start: Optional[Dict[int, Dict[str, np.ndarray | float]]] = None
+                             warm_start: Optional[Dict[int, Dict[str, np.ndarray | float]]] = None,
+                             iteration_recorder=None,
                              ) -> OptimizationResult:
         """Build and solve the NLP for a path."""
         n_regions = len(path_regions)
@@ -315,12 +380,12 @@ class PathNLPSolver:
         
         # =====================================================================
         # Decision variables
-        # For each region v: s_v^-, s_v^+, w_v, Delta_v
+        # For each region v: s_v^-, w_v, Delta_v. The exit state is the
+        # endpoint-map expression F_v(s_v^-, w_v, Delta_v).
         # =====================================================================
         
         # Variable vectors
         s_minus_list = []  # Entry states
-        s_plus_list = []   # Exit states
         w_list = []        # Control parameters
         delta_list = []    # Time durations
         
@@ -337,18 +402,17 @@ class PathNLPSolver:
         )
         
         for i, region_idx in enumerate(path_regions):
-            region = self.graph.regions[region_idx]
             warm = warm_start.get(region_idx) if warm_start is not None else None
-            node_id = f"R{region_idx}"
+            node_id = region_node_label(region_idx)
             incoming_edge = (
                 (SOURCE, node_id)
                 if i == 0 else
-                (f"R{path_regions[i - 1]}", node_id)
+                (region_node_label(path_regions[i - 1]), node_id)
             )
             outgoing_edge = (
                 (node_id, TARGET)
                 if i == n_regions - 1 else
-                (node_id, f"R{path_regions[i + 1]}")
+                (node_id, region_node_label(path_regions[i + 1]))
             )
             entry_pos = _get_graph_edge_anchor(
                 self.graph, incoming_edge, start_state, goal_state
@@ -364,7 +428,7 @@ class PathNLPSolver:
                 self.config.delta_min,
                 min(
                     self.config.delta_max,
-                    float(np.linalg.norm(direction)) / max(abs(self.config.v_max), 1e-6)
+                    float(np.linalg.norm(direction)) / self.speed_guess_scale
                 )
             )
             
@@ -372,45 +436,27 @@ class PathNLPSolver:
             s_minus = ca.MX.sym(f's_minus_{i}', n_x)
             s_minus_list.append(s_minus)
             
-            # Bounds: position in region, angle free
-            lbx.extend([self.position_lb[0], self.position_lb[1], -2*np.pi])
-            ubx.extend([self.position_ub[0], self.position_ub[1], 2*np.pi])
-            
-            if warm is not None and 's_minus' in warm:
-                s_minus_init = np.asarray(warm['s_minus'], dtype=float).copy()
-                s_minus_init[:2] = entry_pos
-                s_minus_init[2] = init_theta
-                x0.extend(s_minus_init.tolist())
-            else:
-                x0.extend([entry_pos[0], entry_pos[1], init_theta])
-            
-            # Exit state s_v^+
-            s_plus = ca.MX.sym(f's_plus_{i}', n_x)
-            s_plus_list.append(s_plus)
-            
-            lbx.extend([self.position_lb[0], self.position_lb[1], -2*np.pi])
-            ubx.extend([self.position_ub[0], self.position_ub[1], 2*np.pi])
-            
-            if warm is not None and 's_plus' in warm:
-                s_plus_init = np.asarray(warm['s_plus'], dtype=float).copy()
-                s_plus_init[:2] = exit_pos
-                s_plus_init[2] = init_theta
-                x0.extend(s_plus_init.tolist())
-            else:
-                x0.extend([exit_pos[0], exit_pos[1], init_theta])
+            lbx.extend(self.state_lb.tolist())
+            ubx.extend(self.state_ub.tolist())
+
+            s_minus_init = _state_guess_from_position(
+                self.dynamics,
+                entry_pos,
+                init_theta,
+                warm.get('s_minus') if warm is not None and 's_minus' in warm else None,
+            )
+            x0.extend(s_minus_init.tolist())
             
             # Control parameters w_v
             w = ca.MX.sym(f'w_{i}', n_w)
             w_list.append(w)
             
-            # Control bounds
-            for seg in range(self.config.n_control_segments):
-                lbx.extend([self.config.v_min, self.config.omega_min])
-                ubx.extend([self.config.v_max, self.config.omega_max])
+            lbx.extend(self.w_lb.tolist())
+            ubx.extend(self.w_ub.tolist())
             if warm is not None and 'w' in warm:
                 x0.extend(np.asarray(warm['w'], dtype=float).tolist())
             else:
-                x0.extend([0.5, 0.0] * self.config.n_control_segments)
+                x0.extend(self.nominal_w.tolist())
             
             # Time duration Delta_v
             delta = ca.MX.sym(f'delta_{i}', 1)
@@ -426,124 +472,59 @@ class PathNLPSolver:
         # Stack all variables
         x_vars = []
         for i in range(n_regions):
-            x_vars.extend([s_minus_list[i], s_plus_list[i], w_list[i], delta_list[i]])
+            x_vars.extend([s_minus_list[i], w_list[i], delta_list[i]])
         
         x = ca.vertcat(*x_vars)
+        s_plus_expr_list = [
+            self.F_endpoint(s_minus_list[i], w_list[i], delta_list[i])
+            for i in range(n_regions)
+        ]
         
         # =====================================================================
         # Constraints
         # =====================================================================
-        
-        g = []      # Constraint expressions
-        lbg = []    # Lower bounds
-        ubg = []    # Upper bounds
-        
-        # -----------------------------------------------------------------
-        # Layer 4: Nonlinear multiple-shooting dynamics
-        # -----------------------------------------------------------------
-        
-        for i, region_idx in enumerate(path_regions):
-            s_minus = s_minus_list[i]
-            s_plus = s_plus_list[i]
-            w = w_list[i]
-            delta = delta_list[i]
-            
-            # Defect constraint: s_plus - F(s_minus, w, delta) = 0
-            F_result = self.F_endpoint(s_minus, w, delta)
-            defect = s_plus - F_result
-            
-            g.append(defect)
-            lbg.extend([0.0] * n_x)
-            ubg.extend([0.0] * n_x)
-        
-        # -----------------------------------------------------------------
-        # Layer 2: Region geometry constraints.
-        # Interior mesh points must stay strictly inside the region, while
-        # entry/exit states are only required to remain in the closed set so
-        # transitions across shared boundaries stay feasible.
-        # -----------------------------------------------------------------
-        
-        for i, region_idx in enumerate(path_regions):
-            region = self.graph.regions[region_idx]
-            s_minus = s_minus_list[i]
-            s_plus = s_plus_list[i]
-            w = w_list[i]
-            delta = delta_list[i]
-            
-            A_dm = ca.DM(region.A)
-            b_dm = ca.DM(region.b)
-            boundary_tol = self.config.boundary_tolerance
 
-            # Entry and exit states may lie on the boundary.
-            for endpoint in (s_minus[:2], s_plus[:2]):
-                closure_violation = ca.mtimes(A_dm, endpoint) - b_dm - boundary_tol
-                g.append(closure_violation)
-                lbg.extend([-np.inf] * len(region.b))
-                ubg.extend([0.0] * len(region.b))
+        g, lbg, ubg = merge_constraint_layers([
+            build_fixed_path_geometry_constraints(
+                self.graph,
+                self.dynamics,
+                path_regions,
+                s_minus_list,
+                s_plus_expr_list,
+                w_list,
+                delta_list,
+                self.mesh_sampler,
+                n_mesh,
+                self.config.safety_margin,
+                self.config.boundary_tolerance,
+            ),
+            build_fixed_path_cbf_safety_constraints(
+                self.graph,
+                path_regions,
+                s_minus_list,
+                w_list,
+                delta_list,
+                self.cbf_sampler,
+                n_mesh,
+                self.config.cbf_alpha,
+            ),
+            build_fixed_path_coupling_constraints(
+                s_minus_list,
+                s_plus_expr_list,
+                w_list,
+                self.control_param,
+                self.config.enforce_control_continuity,
+            ),
+            build_fixed_path_boundary_constraints(
+                self.dynamics,
+                s_minus_list[0],
+                s_plus_expr_list[-1],
+                start_state,
+                goal_state,
+            ),
+        ])
 
-            mesh_positions = self.mesh_sampler(s_minus, w, delta)
-            margin = self.config.safety_margin
-            
-            for k in _interior_mesh_indices(n_mesh):
-                pos = mesh_positions[k, :]
-                violation = ca.mtimes(A_dm, pos.T) - b_dm + margin
-                g.append(violation)
-                lbg.extend([-np.inf] * len(region.b))
-                ubg.extend([0.0] * len(region.b))
-        
-        # -----------------------------------------------------------------
-        # Layer 3: On/off coupling (interface matching)
-        # Since path is fixed, enforce: s_u^+ = s_v^- at interfaces
-        # -----------------------------------------------------------------
-        
-        for i in range(n_regions - 1):
-            # Coupling between consecutive regions
-            s_plus_curr = s_plus_list[i]
-            s_minus_next = s_minus_list[i + 1]
-            
-            # Continuity: s_u^+ = s_v^-
-            coupling = s_plus_curr - s_minus_next
-            
-            g.append(coupling)
-            lbg.extend([0.0] * n_x)
-            ubg.extend([0.0] * n_x)
-            
-            # Interface membership is enforced by:
-            # 1. endpoint closure of s_u^+ in Q_u
-            # 2. endpoint closure of s_v^- in Q_v
-            # 3. coupling s_u^+ = s_v^-
-            # This works for both overlapping regions and regions that only
-            # touch on a shared boundary.
-
-            if self.config.enforce_control_continuity:
-                u_exit_curr = self.control_param.evaluate_casadi(1.0, w_list[i])
-                u_entry_next = self.control_param.evaluate_casadi(0.0, w_list[i + 1])
-                control_coupling = u_exit_curr - u_entry_next
-
-                g.append(control_coupling)
-                lbg.extend([0.0] * self.dynamics.n_u)
-                ubg.extend([0.0] * self.dynamics.n_u)
-        
-        # -----------------------------------------------------------------
-        # Boundary conditions
-        # -----------------------------------------------------------------
-        
-        # Start: s_0^- position must match start_state position
-        g.append(s_minus_list[0][:2] - start_state[:2])
-        lbg.extend([0.0, 0.0])
-        ubg.extend([0.0, 0.0])
-        
-        # Start heading is left free (robot can orient itself)
-        
-        # Goal: s_N^+ position must match goal_state position
-        g.append(s_plus_list[-1][:2] - goal_state[:2])
-        lbg.extend([0.0, 0.0])
-        ubg.extend([0.0, 0.0])
-        
-        # Goal heading is left free (robot can arrive from any angle)
-        
-        # Stack constraints
-        g = ca.vertcat(*g)
+        g = stack_constraints(g)
         
         # =====================================================================
         # Objective: sum of local costs
@@ -554,6 +535,7 @@ class PathNLPSolver:
         w_L = self.config.w_L
         w_E = self.config.w_E
         w_u_smooth = self.config.w_u_smooth
+        w_theta_smooth = self.config.w_theta_smooth
         
         for i in range(n_regions):
             local_cost = self.local_cost_fn(
@@ -561,6 +543,12 @@ class PathNLPSolver:
                 a, w_L, w_E, w_u_smooth
             )
             cost = cost + local_cost
+
+        if w_theta_smooth > 0.0 and self.dynamics.angle_indices:
+            for i in range(n_regions - 1):
+                for angle_idx in self.dynamics.angle_indices:
+                    theta_jump = s_plus_expr_list[i][angle_idx] - s_minus_list[i + 1][angle_idx]
+                    cost = cost + w_theta_smooth * theta_jump ** 2
         
         # =====================================================================
         # Solve NLP
@@ -578,6 +566,10 @@ class PathNLPSolver:
             'ipopt.print_level': self.config.print_level,
             'print_time': 0
         }
+        if iteration_recorder is not None:
+            if hasattr(iteration_recorder, "configure"):
+                iteration_recorder.configure(int(x.numel()), int(g.numel()))
+            opts['iteration_callback'] = iteration_recorder
         
         solver = ca.nlpsol('solver', 'ipopt', nlp, opts)
         
@@ -629,8 +621,8 @@ class PathNLPSolver:
             n_paths_evaluated=1
         )
         
-        # Variables per region: s_minus (n_x) + s_plus (n_x) + w (n_w) + delta (1)
-        vars_per_region = 2 * n_x + n_w + 1
+        # Variables per region: s_minus (n_x) + w (n_w) + delta (1).
+        vars_per_region = n_x + n_w + 1
         
         for i, region_idx in enumerate(path_regions):
             offset = i * vars_per_region
@@ -638,13 +630,14 @@ class PathNLPSolver:
             s_minus = x_opt[offset:offset + n_x]
             offset += n_x
             
-            s_plus = x_opt[offset:offset + n_x]
-            offset += n_x
-            
             w = x_opt[offset:offset + n_w]
             offset += n_w
             
-            delta = x_opt[offset]
+            delta = float(x_opt[offset])
+            s_plus = np.array(
+                self.F_endpoint(s_minus, w, delta),
+                dtype=float,
+            ).reshape(-1)
             
             result.entry_states[region_idx] = s_minus
             result.exit_states[region_idx] = s_plus
@@ -675,7 +668,9 @@ class PathNLPSolver:
         # Interface points
         for i in range(len(path_regions) - 1):
             region_idx = path_regions[i]
-            interface_pt = result.exit_states[region_idx][:2]
+            interface_pt = self.dynamics.project_to_position(
+                result.exit_states[region_idx]
+            )
             result.interface_points.append(interface_pt)
         
         # Compute defect norm
@@ -686,7 +681,10 @@ class PathNLPSolver:
             w = result.control_params[region_idx]
             delta = result.time_durations[region_idx]
             
-            F_result = integrator.integrate(s_minus, w, delta)
+            F_result = np.array(
+                self.F_endpoint(s_minus, w, delta),
+                dtype=float,
+            ).reshape(-1)
             defect = np.linalg.norm(s_plus - F_result)
             defect_norms.append(defect)
         
@@ -696,7 +694,8 @@ class PathNLPSolver:
             result.entry_states,
             result.exit_states,
             start_state,
-            goal_state
+            goal_state,
+            self.dynamics.position_indices,
         )
         result.max_control_jump = _compute_control_jump(
             path_regions,
@@ -737,49 +736,66 @@ class IntegratedMIOCPSolver:
         self.graph = graph
         self.dynamics = dynamics
         self.config = config
-        self.path_solver = PathNLPSolver(graph, dynamics, config)
-        
+
         self.control_param = ControlParameterization(
             n_u=dynamics.n_u,
             parameterization="piecewise_constant",
             n_segments=config.n_control_segments
         )
-        
-        self.F_endpoint = create_casadi_integrator(
-            dynamics, self.control_param, config.n_integration_steps
+
+        self.integration_bundle = create_integration_bundle(
+            dynamics,
+            self.control_param,
+            config.n_integration_steps,
+            config.n_mesh_points,
         )
-        self.mesh_sampler = create_casadi_trajectory_sampler(
-            dynamics, self.control_param,
-            config.n_integration_steps, config.n_mesh_points
+        self.F_endpoint = self.integration_bundle.F_endpoint
+        self.mesh_sampler = self.integration_bundle.mesh_sampler
+        self.cbf_sampler = self.integration_bundle.cbf_sampler
+        self.local_cost_fn = self.integration_bundle.local_cost_fn
+
+        self.path_solver = PathNLPSolver(
+            graph,
+            dynamics,
+            config,
+            control_param=self.control_param,
+            integration_bundle=self.integration_bundle,
         )
-        self.local_cost_fn = create_casadi_local_cost(
-            dynamics, self.control_param, config.n_integration_steps
-        )
-        
+
         all_vertices = np.vstack([region.vertices for region in graph.regions])
         max_abs_pos = float(np.max(np.abs(all_vertices))) if all_vertices.size else 1.0
         self.position_big_m = max(config.M_position, max_abs_pos + 1.0)
-        self.angle_big_m = 2.0 * np.pi
-        self.state_big_m = np.array(
-            [self.position_big_m, self.position_big_m, self.angle_big_m],
-            dtype=np.float64
+        self.state_big_m = np.full(dynamics.n_x, self.position_big_m, dtype=np.float64)
+        for angle_index in dynamics.angle_indices:
+            self.state_big_m[angle_index] = dynamics.angle_big_m()
+
+        self.control_lb, self.control_ub = dynamics.control_bounds()
+        control_abs_single = np.maximum(np.abs(self.control_lb), np.abs(self.control_ub))
+        control_abs_single = np.maximum(control_abs_single, 1e-6)
+        self.nominal_w = _tile_control_vector(
+            dynamics.nominal_control(),
+            self.control_param,
         )
-        
-        max_v = max(abs(config.v_min), abs(config.v_max), 1e-6)
-        max_omega = max(abs(config.omega_min), abs(config.omega_max), 1e-6)
-        control_abs = []
-        for _ in range(config.n_control_segments):
-            control_abs.extend([max_v, max_omega])
-        self.control_big_m = np.array(control_abs, dtype=np.float64)
-        self.control_value_big_m = np.array([2.0 * max_v, 2.0 * max_omega], dtype=np.float64)
-        
+        self.speed_guess_scale = (
+            max(abs(float(self.control_lb[0])), abs(float(self.control_ub[0])), 1e-6)
+            if self.control_lb.size
+            else 1e-6
+        )
+        self.control_big_m = _tile_control_vector(
+            control_abs_single,
+            self.control_param,
+        )
+        self.control_value_big_m = 2.0 * control_abs_single
+
+        max_v = float(control_abs_single[0]) if control_abs_single.size else 0.0
+        max_control_energy = float(np.dot(control_abs_single, control_abs_single))
         running_cost_upper = (
             config.w_L * (max_v ** 2) +
-            config.w_E * ((max_v ** 2) + (max_omega ** 2))
+            config.w_E * max_control_energy
         )
         smoothness_upper = 0.0
         if config.n_control_segments > 1:
-            max_control_jump_sq = (2.0 * max_v) ** 2 + (2.0 * max_omega) ** 2
+            max_control_jump_sq = float(np.dot(2.0 * control_abs_single, 2.0 * control_abs_single))
             smoothness_upper = (
                 config.w_u_smooth *
                 (config.n_control_segments - 1) *
@@ -1076,7 +1092,7 @@ class IntegratedMIOCPSolver:
         
         warm_edges = [(warm_path[i], warm_path[i + 1]) for i in range(len(warm_path) - 1)]
         warm_edge_set = set(warm_edges)
-        warm_region_set = {node for node in warm_path if node not in [SOURCE, TARGET]}
+        warm_region_set = {node for node in warm_path if not is_terminal_node_id(node)}
         global_heading = float(np.arctan2(
             goal_state[1] - start_state[1],
             goal_state[0] - start_state[0]
@@ -1098,13 +1114,13 @@ class IntegratedMIOCPSolver:
             delta_init = max(
                 self.config.delta_min,
                 min(self.config.delta_max,
-                    distance / max(abs(self.config.v_max), 1e-6))
+                    distance / self.speed_guess_scale)
             )
             
             region_init[node_id] = {
-                's_minus': np.array([entry_pos[0], entry_pos[1], heading], dtype=np.float64),
-                's_plus': np.array([exit_pos[0], exit_pos[1], heading], dtype=np.float64),
-                'w': np.array([0.5, 0.0] * self.config.n_control_segments, dtype=np.float64),
+                's_minus': _state_guess_from_position(self.dynamics, entry_pos, heading),
+                's_plus': _state_guess_from_position(self.dynamics, exit_pos, heading),
+                'w': self.nominal_w.copy(),
                 'delta': delta_init,
                 'rho': max(self.config.a * delta_init, 1e-3),
             }
@@ -1116,8 +1132,10 @@ class IntegratedMIOCPSolver:
                 pos = self._get_edge_anchor(edge, start_state, goal_state)
                 heading = global_heading
                 if edge[1] in region_init:
-                    heading = float(region_init[edge[1]]['s_minus'][2])
-                z0 = np.array([pos[0], pos[1], heading], dtype=np.float64)
+                    angle_indices = self.dynamics.angle_indices
+                    if angle_indices:
+                        heading = float(region_init[edge[1]]['s_minus'][angle_indices[0]])
+                z0 = _state_guess_from_position(self.dynamics, pos, heading)
             interface_init[edge] = z0
         
         y_vars = {}
@@ -1235,143 +1253,82 @@ class IntegratedMIOCPSolver:
         
         x = ca.vertcat(*x_vars)
         
-        g = []
-        lbg = []
-        ubg = []
-        
-        def add_eq(expr):
-            expr = ca.reshape(expr, expr.numel(), 1)
-            g.append(expr)
-            lbg.extend([0.0] * expr.numel())
-            ubg.extend([0.0] * expr.numel())
-        
-        def add_leq(expr):
-            expr = ca.reshape(expr, expr.numel(), 1)
-            g.append(expr)
-            lbg.extend([-np.inf] * expr.numel())
-            ubg.extend([0.0] * expr.numel())
-        
-        # Network flow constraints.
-        add_eq(ca.sum1(ca.vertcat(*[y_vars[edge] for edge in self.graph.source_edges])) - 1.0)
-        add_eq(ca.sum1(ca.vertcat(*[y_vars[edge] for edge in self.graph.target_edges])) - 1.0)
-        
-        for node_id in region_nodes:
-            in_edges = [edge for edge in edges if edge[1] == node_id]
-            out_edges = [edge for edge in edges if edge[0] == node_id]
-            
-            in_flow = ca.sum1(ca.vertcat(*[y_vars[edge] for edge in in_edges])) if in_edges else 0.0
-            out_flow = ca.sum1(ca.vertcat(*[y_vars[edge] for edge in out_edges])) if out_edges else 0.0
-            
-            add_eq(in_flow - p_vars[node_id])
-            add_eq(out_flow - p_vars[node_id])
-        
-        # Region-level variables are zero when the region is inactive.
-        for node_id in region_nodes:
-            p = p_vars[node_id]
-            
-            for state_var in [s_minus_vars[node_id], s_plus_vars[node_id]]:
-                add_leq(state_var - self.state_big_m * p)
-                add_leq(-state_var - self.state_big_m * p)
-            
-            add_leq(w_vars[node_id] - self.control_big_m * p)
-            add_leq(-w_vars[node_id] - self.control_big_m * p)
-            add_leq(delta_vars[node_id] - self.config.delta_max * p)
-            add_leq(self.config.delta_min * p - delta_vars[node_id])
-            add_leq(rho_vars[node_id] - self.rho_big_m * p)
-        
-        # Exact defect dynamics and local cost epigraph.
-        for node_id in region_nodes:
-            s_minus = s_minus_vars[node_id]
-            s_plus = s_plus_vars[node_id]
-            w = w_vars[node_id]
-            delta = delta_vars[node_id]
-            rho = rho_vars[node_id]
-            
-            add_eq(s_plus - self.F_endpoint(s_minus, w, delta))
-            
-            local_cost = self.local_cost_fn(
-                s_minus, w, delta,
-                self.config.a, self.config.w_L, self.config.w_E, self.config.w_u_smooth
-            )
-            add_leq(local_cost - rho)
-        
-        # On/off region geometry via Big-M. Interior mesh points keep a strict
-        # safety margin, while entry/exit/interface points are allowed on the
-        # boundary so touching regions remain feasible.
-        for node_id in region_nodes:
-            region = self.graph.get_region_by_id(node_id)
-            p = p_vars[node_id]
-            s_minus = s_minus_vars[node_id]
-            s_plus = s_plus_vars[node_id]
-            w = w_vars[node_id]
-            delta = delta_vars[node_id]
-            
-            A_dm = ca.DM(region.A)
-            b_dm = ca.DM(region.b)
-            boundary_tol = self.config.boundary_tolerance
-
-            for endpoint in (s_minus[:2], s_plus[:2]):
-                closure_violation = ca.mtimes(A_dm, endpoint) - b_dm - boundary_tol
-                add_leq(closure_violation - self.position_big_m * (1 - p))
-
-            mesh_positions = self.mesh_sampler(s_minus, w, delta)
-            
-            for k in _interior_mesh_indices(n_mesh):
-                pos = mesh_positions[k, :]
-                violation = ca.mtimes(A_dm, pos.T) - b_dm + self.config.safety_margin
-                add_leq(violation - self.position_big_m * (1 - p))
-        
-        # Interface membership and on/off coupling for region-region edges.
-        for edge in self.graph.region_edges:
-            u, v = edge
-            y = y_vars[edge]
-            z = z_vars[edge]
-            
-            add_leq(z - self.state_big_m * y)
-            add_leq(-z - self.state_big_m * y)
-
-            region_u = self.graph.get_region_by_id(u)
-            region_v = self.graph.get_region_by_id(v)
-            z_pos = z[:2]
-            boundary_tol = self.config.boundary_tolerance
-
-            for region in (region_u, region_v):
-                A_dm = ca.DM(region.A)
-                b_dm = ca.DM(region.b)
-                closure_violation = ca.mtimes(A_dm, z_pos) - b_dm - boundary_tol
-                add_leq(closure_violation - self.position_big_m * (1 - y))
-            
-            diff_upstream = s_plus_vars[u] - z
-            diff_downstream = s_minus_vars[v] - z
-            add_leq(diff_upstream - self.config.M_interface * (1 - y))
-            add_leq(-diff_upstream - self.config.M_interface * (1 - y))
-            add_leq(diff_downstream - self.config.M_interface * (1 - y))
-            add_leq(-diff_downstream - self.config.M_interface * (1 - y))
-
-            if self.config.enforce_control_continuity:
-                u_exit = self.control_param.evaluate_casadi(1.0, w_vars[u])
-                u_entry = self.control_param.evaluate_casadi(0.0, w_vars[v])
-                control_diff = u_exit - u_entry
-                add_leq(control_diff - self.control_value_big_m * (1 - y))
-                add_leq(-control_diff - self.control_value_big_m * (1 - y))
-        
-        # Source and target boundary coupling.
-        for edge in self.graph.source_edges:
-            _, v = edge
-            y = y_vars[edge]
-            diff = s_minus_vars[v][:2] - start_state[:2]
-            add_leq(diff - self.config.M_interface * (1 - y))
-            add_leq(-diff - self.config.M_interface * (1 - y))
-        
-        for edge in self.graph.target_edges:
-            u, _ = edge
-            y = y_vars[edge]
-            diff = s_plus_vars[u][:2] - goal_state[:2]
-            add_leq(diff - self.config.M_interface * (1 - y))
-            add_leq(-diff - self.config.M_interface * (1 - y))
+        g, lbg, ubg = merge_constraint_layers([
+            build_network_flow_constraints(
+                y_vars,
+                p_vars,
+                self.graph.source_edges,
+                self.graph.target_edges,
+                region_nodes,
+                edges,
+            ),
+            build_activation_constraints(
+                region_nodes,
+                p_vars,
+                s_minus_vars,
+                s_plus_vars,
+                w_vars,
+                delta_vars,
+                rho_vars,
+                self.state_big_m,
+                self.control_big_m,
+                self.config.delta_min,
+                self.config.delta_max,
+                self.rho_big_m,
+            ),
+            build_integrated_dynamics_constraints(
+                region_nodes,
+                s_minus_vars,
+                s_plus_vars,
+                w_vars,
+                delta_vars,
+                rho_vars,
+                self.F_endpoint,
+                self.local_cost_fn,
+                (
+                    self.config.a,
+                    self.config.w_L,
+                    self.config.w_E,
+                    self.config.w_u_smooth,
+                ),
+            ),
+            build_integrated_geometry_constraints(
+                self.graph,
+                self.dynamics,
+                region_nodes,
+                p_vars,
+                s_minus_vars,
+                s_plus_vars,
+                w_vars,
+                delta_vars,
+                self.mesh_sampler,
+                n_mesh,
+                self.config.safety_margin,
+                self.config.boundary_tolerance,
+                self.position_big_m,
+            ),
+            build_integrated_coupling_constraints(
+                self.graph,
+                self.dynamics,
+                y_vars,
+                s_minus_vars,
+                s_plus_vars,
+                w_vars,
+                z_vars,
+                self.control_param,
+                self.state_big_m,
+                self.position_big_m,
+                self.config.M_interface,
+                self.control_value_big_m,
+                self.config.boundary_tolerance,
+                start_state,
+                goal_state,
+                self.config.enforce_control_continuity,
+            ),
+        ])
         
         cost = ca.sum1(ca.vertcat(*[rho_vars[node_id] for node_id in region_nodes]))
-        g_expr = ca.vertcat(*g) if g else ca.MX.zeros(0, 1)
+        g_expr = stack_constraints(g)
         
         nlp = {'x': x, 'f': cost, 'g': g_expr}
         solver = ca.nlpsol(
@@ -1433,7 +1390,11 @@ class IntegratedMIOCPSolver:
                 constraint_violation=self._compute_constraint_violation(g_val, lbg, ubg)
             )
         
-        path_regions = [int(node_id[1:]) for node_id in path if node_id not in [SOURCE, TARGET]]
+        path_regions = [
+            region_index_from_node_id(node_id)
+            for node_id in path
+            if not is_terminal_node_id(node_id)
+        ]
         result = OptimizationResult(
             success=success,
             path=path,
@@ -1453,7 +1414,7 @@ class IntegratedMIOCPSolver:
         mesh_tau = np.linspace(0.0, 1.0, self.config.n_mesh_points)
         
         for node_id in path[1:-1]:
-            region_idx = int(node_id[1:])
+            region_idx = region_index_from_node_id(node_id)
             s_minus = x_opt[var_slices['s_minus'][node_id]]
             s_plus = x_opt[var_slices['s_plus'][node_id]]
             w = x_opt[var_slices['w'][node_id]]
@@ -1474,21 +1435,29 @@ class IntegratedMIOCPSolver:
         defect_norms = []
         for i in range(len(path) - 2):
             region_id = path[i + 1]
-            region_idx = int(region_id[1:])
+            region_idx = region_index_from_node_id(region_id)
             
             s_minus = result.entry_states[region_idx]
             s_plus = result.exit_states[region_idx]
             w = result.control_params[region_idx]
             delta = result.time_durations[region_idx]
             
-            defect = np.linalg.norm(s_plus - integrator.integrate(s_minus, w, delta))
+            F_result = np.array(
+                self.F_endpoint(s_minus, w, delta),
+                dtype=float,
+            ).reshape(-1)
+            defect = np.linalg.norm(s_plus - F_result)
             defect_norms.append(defect)
             
             next_edge = (path[i + 1], path[i + 2])
             if next_edge in var_slices['z']:
-                result.interface_points.append(x_opt[var_slices['z'][next_edge]][:2])
+                result.interface_points.append(
+                    self.dynamics.project_to_position(x_opt[var_slices['z'][next_edge]])
+                )
             elif i < len(path) - 3:
-                result.interface_points.append(s_plus[:2])
+                result.interface_points.append(
+                    self.dynamics.project_to_position(s_plus)
+                )
         
         result.defect_norm = max(defect_norms) if defect_norms else 0.0
         result.max_connection_gap = _compute_connection_gap(
@@ -1496,7 +1465,8 @@ class IntegratedMIOCPSolver:
             result.entry_states,
             result.exit_states,
             start_state,
-            goal_state
+            goal_state,
+            self.dynamics.position_indices,
         )
         result.max_control_jump = _compute_control_jump(
             path_regions,
@@ -1519,7 +1489,6 @@ def create_integrated_optimizer_from_config(graph: RegionGraph,
     """
     cost_config = config_dict.get('cost', {})
     shooting_config = config_dict.get('shooting', {})
-    dynamics_config = config_dict.get('dynamics', {})
     optimizer_config = config_dict.get('optimizer', {})
     control_config = config_dict.get('control', {})
     
@@ -1528,17 +1497,15 @@ def create_integrated_optimizer_from_config(graph: RegionGraph,
         w_L=cost_config.get('w_L', 1.0),
         w_E=cost_config.get('w_E', 1.0),
         w_u_smooth=cost_config.get('w_u_smooth', 0.2),
+        w_theta_smooth=cost_config.get('w_theta_smooth', 0.0),
         n_integration_steps=shooting_config.get('n_integration_steps', 20),
         n_mesh_points=shooting_config.get('n_mesh_points', 3),
         n_control_segments=control_config.get('n_segments', 2),
         safety_margin=shooting_config.get('safety_margin', 0.02),
+        cbf_alpha=shooting_config.get('cbf_alpha', 0.0),
         boundary_tolerance=shooting_config.get('boundary_tolerance', 1e-8),
-        delta_min=dynamics_config.get('delta_min', 0.1),
-        delta_max=dynamics_config.get('delta_max', 10.0),
-        v_min=dynamics_config.get('v_min', -2.0),
-        v_max=dynamics_config.get('v_max', 2.0),
-        omega_min=dynamics_config.get('omega_min', -np.pi),
-        omega_max=dynamics_config.get('omega_max', np.pi),
+        delta_min=config_dict.get('dynamics', {}).get('delta_min', 0.1),
+        delta_max=config_dict.get('dynamics', {}).get('delta_max', 10.0),
         M_position=optimizer_config.get('big_M', {}).get('position', 20.0),
         M_interface=optimizer_config.get('big_M', {}).get('interface', 20.0),
         M_time=optimizer_config.get('big_M', {}).get('time', 100.0),

@@ -126,6 +126,120 @@ def run_maze_benchmark(config_path: str,
     )
 
 
+def run_shooting_animation(config_path: str,
+                           scenario_name: str | None,
+                           verbose: bool = True) -> str:
+    """Run a fixed-path NLP with iteration recording and create a GIF."""
+    import numpy as np
+
+    from graph_types import is_terminal_node_id, region_index_from_node_id
+    from scenario_builder import prepare_scenario
+    from shooting_animation import (
+        ShootingIterationRecorder,
+        create_shooting_convergence_animation,
+        parse_recorder_snapshots,
+        parse_shooting_snapshot,
+    )
+
+    config = DemoConfig(config_path)
+    scenario_name = scenario_name or config.default_scenario_name()
+    prepared = prepare_scenario(config, scenario_name)
+
+    if verbose:
+        print(f"Running integrated solve to recover path for scenario '{scenario_name}'...")
+
+    relaxation_result = prepared.optimizer.solve(
+        prepared.resolved.start_state,
+        prepared.resolved.goal_state,
+        verbose=verbose,
+    )
+    if not relaxation_result.success:
+        raise RuntimeError(
+            f"Could not recover a path for shooting animation: "
+            f"{relaxation_result.solver_status}"
+        )
+
+    path = relaxation_result.path
+    path_regions = [
+        region_index_from_node_id(node_id)
+        for node_id in path
+        if not is_terminal_node_id(node_id)
+    ]
+
+    if verbose:
+        print(f"Recording fixed-path NLP iterations on path: {' -> '.join(path)}")
+
+    path_solver = prepared.optimizer.path_solver
+    recorder = ShootingIterationRecorder(record_every=1, max_snapshots=500)
+    fixed_result = path_solver.solve_path(
+        path,
+        prepared.resolved.start_state,
+        prepared.resolved.goal_state,
+        iteration_recorder=recorder,
+    )
+    if not fixed_result.success:
+        raise RuntimeError(
+            f"Fixed-path solve failed during shooting animation: "
+            f"{fixed_result.solver_status}"
+        )
+
+    shooting_cfg = prepared.resolved.runtime_config.get("shooting", {})
+    n_integration_steps = shooting_cfg.get("n_integration_steps", 20)
+    n_mesh_points = shooting_cfg.get("n_mesh_points", 5)
+
+    snapshots = parse_recorder_snapshots(
+        recorder,
+        path_regions,
+        prepared.dynamics.n_x,
+        path_solver.control_param.n_w,
+        prepared.dynamics,
+        path_solver.control_param,
+        path_solver.F_endpoint,
+        n_integration_steps,
+        n_mesh_points=n_mesh_points,
+    )
+
+    final_x = []
+    for region_idx in path_regions:
+        final_x.extend(fixed_result.entry_states[region_idx].tolist())
+        final_x.extend(fixed_result.control_params[region_idx].tolist())
+        final_x.append(float(fixed_result.time_durations[region_idx]))
+
+    final_snapshot = parse_shooting_snapshot(
+        np.asarray(final_x, dtype=np.float64),
+        path_regions,
+        prepared.dynamics.n_x,
+        path_solver.control_param.n_w,
+        prepared.dynamics,
+        path_solver.control_param,
+        path_solver.F_endpoint,
+        n_integration_steps,
+        n_mesh_points=n_mesh_points,
+        cost=fixed_result.total_cost,
+        iteration=(snapshots[-1]["iteration"] + 1) if snapshots else 0,
+    )
+    if not snapshots or snapshots[-1]["max_gap"] > final_snapshot["max_gap"] + 1e-10:
+        snapshots.append(final_snapshot)
+
+    output_dir = config.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, f"{scenario_name}_shooting_convergence.gif")
+    animation_cfg = prepared.resolved.runtime_config.get("visualization", {}).get("animation", {})
+    create_shooting_convergence_animation(
+        snapshots,
+        prepared.graph,
+        prepared.workspace_bounds,
+        prepared.resolved.start_state,
+        prepared.resolved.goal_state,
+        filename=output_path,
+        obstacles=prepared.environment.obstacles,
+        fps=animation_cfg.get("shooting_fps", animation_cfg.get("fps", 12)),
+        max_animation_frames=animation_cfg.get("max_shooting_frames", 200),
+    )
+
+    return output_path
+
+
 def print_formulation_summary() -> None:
     """Print a concise summary of the integrated formulation."""
     summary = """
@@ -177,6 +291,7 @@ Examples:
   python main_demo.py --scenario maze
   python main_demo.py --list-presets
   python main_demo.py --visualize-only --scenario default
+  python main_demo.py --shooting-animation --scenario default
   python main_demo.py --config config.yaml --quick-test
   python main_demo.py --maze-benchmark --maze-count 5 --maze-size 25 --maze-knock-downs 25 --maze-seed 4
   python main_demo.py --maze-benchmark --maze-debug-geometry --maze-count 1 --maze-size 25 --maze-knock-downs 25 --maze-seed 4
@@ -187,6 +302,7 @@ Examples:
     parser.add_argument("--scenario", type=str, help="Run one named scenario from the config")
     parser.add_argument("--quick-test", action="store_true", help="Run one integrated-solver quick test")
     parser.add_argument("--visualize-only", action="store_true", help="Only visualize one scenario layout")
+    parser.add_argument("--shooting-animation", action="store_true", help="Create a fixed-path shooting convergence GIF")
     parser.add_argument("--formulation", action="store_true", help="Print formulation summary")
     parser.add_argument("--list-presets", action="store_true", help="List available geometry presets")
     parser.add_argument("--list-scenarios", action="store_true", help="List available scenarios")
@@ -222,6 +338,15 @@ Examples:
 
     if args.visualize_only:
         visualize_environment_only(args.config, args.scenario)
+        return
+
+    if args.shooting_animation:
+        output_path = run_shooting_animation(
+            args.config,
+            args.scenario,
+            verbose=not args.quiet,
+        )
+        print(f"Saved: {output_path}")
         return
 
     if args.quick_test:

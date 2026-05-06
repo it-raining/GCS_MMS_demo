@@ -73,7 +73,11 @@ shooting:
   n_mesh_points: 10
   
   # Safety margin epsilon for region containment
-  safety_margin: 0.02
+  safety_margin: 0.01
+
+  # Optional control barrier function safety layer for fixed-path polishing.
+  # Set to 0.0 to disable and use mesh containment only.
+  cbf_alpha: 0.0
 
 # -----------------------------------------------------------------------------
 # Cost Function Weights
@@ -94,7 +98,10 @@ cost:
 
   # Penalize abrupt control changes between neighboring control segments.
   # Larger values make turns and accelerations smoother, but can increase time.
-  w_u_smooth: 0.2
+  w_u_smooth: 0.5
+
+  # Optional soft heading smoothness term across fixed-path interfaces.
+  w_theta_smooth: 0.0
 # -----------------------------------------------------------------------------
 # Optimizer Configuration
 # -----------------------------------------------------------------------------
@@ -130,7 +137,7 @@ visualization:
   # Colors
   colors:
     workspace: "#f0f0f0"
-    obstacles: "#404040"
+    obstacles: "#000000"
     regions: "tab10"  # colormap name
     trajectory: "#2196F3"
     start: "#4CAF50"
@@ -144,6 +151,7 @@ visualization:
   # Animation settings
   animation:
     fps: 30
+    shooting_fps: 12
     duration: 5.0  # seconds
 
 # -----------------------------------------------------------------------------
@@ -165,7 +173,7 @@ scenarios:
     problem_preset: "default"
     overrides:
       shooting:
-        n_mesh_points: 5
+        n_mesh_points: 7
     
   maze:
     name: "Maze Environment"
@@ -177,7 +185,7 @@ scenarios:
         # The maze decomposition often creates narrow passages and sliver
         # interface regions. Three mesh points only checks one interior sample
         # per region, which is too sparse for curved unicycle trajectories.
-        n_mesh_points: 5
+        n_mesh_points: 3
       control:
         # Two piecewise-constant segments per region are often too coarse for
         # the maze ACD decomposition, especially around tiny bridge regions.

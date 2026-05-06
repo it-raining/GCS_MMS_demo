@@ -5,17 +5,15 @@ Handles:
 - Polytope representation (V-rep and H-rep)
 - Intersection computation
 - Membership checking with safety margin
-- Perspective set approximation via Big-M
 """
 
 import numpy as np
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional
 from dataclasses import dataclass, field
-from scipy.spatial import ConvexHull, HalfspaceIntersection
 from scipy.optimize import linprog
-from shapely.geometry import Polygon, Point
-import warnings
+from shapely.geometry import Polygon
 
+from graph_types import region_node_label
 from problem_data import DEFAULT_PROBLEM
 
 
@@ -319,7 +317,7 @@ def create_regions_from_vertices_list(vertices_list: List[np.ndarray]) -> List[C
     """
     regions = []
     for i, vertices in enumerate(vertices_list):
-        region = ConvexRegion(vertices=vertices, index=i, label=f"R{i}")
+        region = ConvexRegion(vertices=vertices, index=i, label=region_node_label(i))
         regions.append(region)
     return regions
 
@@ -376,63 +374,3 @@ def get_original_regions() -> List[ConvexRegion]:
         for vertices in DEFAULT_PROBLEM.region_vertices
     ]
     return create_regions_from_vertices_list(vertices_list)
-
-
-class PerspectiveApproximation:
-    """
-    Approximation of perspective/homogenization for on/off geometry.
-    
-    For a convex set C, the perspective set is:
-        C_tilde = {(x, lambda) : lambda > 0, x/lambda in C}
-    
-    When lambda in {0, 1} (binary):
-        - lambda = 1: x in C
-        - lambda = 0: x = 0 (off-state)
-    
-    We approximate using Big-M constraints:
-        A @ x <= b * lambda + M * (1 - lambda)  [membership when active]
-        -M * lambda <= x <= M * lambda          [zero when inactive]
-    
-    This is NOT equivalent to true perspective (weaker relaxation)
-    but maintains correct binary semantics.
-    """
-    
-    def __init__(self, region: ConvexRegion, big_M: float = 20.0):
-        """
-        Args:
-            region: The convex region C
-            big_M: Big-M constant for constraint encoding
-        """
-        self.region = region
-        self.big_M = big_M
-        self.A = region.A
-        self.b = region.b
-    
-    def get_constraints_active(self, x: np.ndarray) -> np.ndarray:
-        """
-        Get constraint violations when lambda = 1 (active).
-        
-        Returns:
-            violations = A @ x - b (should all be <= 0)
-        """
-        return self.A @ x - self.b
-    
-    def get_big_M_constraints(self) -> Dict:
-        """
-        Return Big-M constraint matrices for MINLP formulation.
-        
-        For binary lambda and continuous x:
-            A @ x <= b + M * (1 - lambda)   [1]
-            x >= -M * lambda                [2]
-            x <= M * lambda                 [3]
-        
-        Returns:
-            Dictionary with constraint components
-        """
-        return {
-            'A': self.A,
-            'b': self.b,
-            'M': self.big_M,
-            'n_constraints': len(self.b),
-            'dim': self.A.shape[1]
-        }
