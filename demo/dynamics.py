@@ -34,6 +34,17 @@ class DynamicsModel(ABC):
     def n_pos(self) -> int:
         """Position dimension (for safety constraints)."""
         pass
+
+    @property
+    @abstractmethod
+    def position_indices(self) -> Tuple[int, ...]:
+        """State indices that represent workspace position."""
+        pass
+
+    @property
+    def angle_indices(self) -> Tuple[int, ...]:
+        """State indices with angular wrapping semantics."""
+        return ()
     
     @abstractmethod
     def f(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
@@ -86,6 +97,33 @@ class DynamicsModel(ABC):
         """CasADi symbolic version of the physical position derivative."""
         pass
 
+    @abstractmethod
+    def state_bounds(self,
+                     position_lb: Optional[np.ndarray] = None,
+                     position_ub: Optional[np.ndarray] = None
+                     ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Return lower/upper bounds for state variables.
+
+        Position bounds are supplied by the environment because they are graph
+        dependent; non-position bounds belong to the dynamics model.
+        """
+        pass
+
+    @abstractmethod
+    def control_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Return lower/upper bounds for one instantaneous control vector."""
+        pass
+
+    def nominal_control(self) -> np.ndarray:
+        """Return a feasible initial control guess."""
+        u_min, u_max = self.control_bounds()
+        return 0.5 * (u_min + u_max)
+
+    def angle_big_m(self) -> float:
+        """Return a Big-M value for angular state components."""
+        return 2.0 * np.pi
+
 
 @dataclass
 class UnicycleModel(DynamicsModel):
@@ -124,6 +162,14 @@ class UnicycleModel(DynamicsModel):
     @property
     def n_pos(self) -> int:
         return 2
+
+    @property
+    def position_indices(self) -> Tuple[int, ...]:
+        return (0, 1)
+
+    @property
+    def angle_indices(self) -> Tuple[int, ...]:
+        return (2,)
     
     def f(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
         """
@@ -182,6 +228,32 @@ class UnicycleModel(DynamicsModel):
             v * ca.cos(theta),
             v * ca.sin(theta),
         )
+
+    def state_bounds(self,
+                     position_lb: Optional[np.ndarray] = None,
+                     position_ub: Optional[np.ndarray] = None
+                     ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return bounds for [px, py, theta]."""
+        if position_lb is None:
+            position_lb = np.array([-np.inf, -np.inf], dtype=np.float64)
+        if position_ub is None:
+            position_ub = np.array([np.inf, np.inf], dtype=np.float64)
+
+        lb = np.array([position_lb[0], position_lb[1], -2.0 * np.pi], dtype=np.float64)
+        ub = np.array([position_ub[0], position_ub[1], 2.0 * np.pi], dtype=np.float64)
+        return lb, ub
+
+    def control_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Return bounds for [v, omega]."""
+        return (
+            np.array([self.v_min, self.omega_min], dtype=np.float64),
+            np.array([self.v_max, self.omega_max], dtype=np.float64),
+        )
+
+    def nominal_control(self) -> np.ndarray:
+        """Prefer a small positive forward speed as the NLP initial guess."""
+        u_min, u_max = self.control_bounds()
+        return np.clip(np.array([0.5, 0.0], dtype=np.float64), u_min, u_max)
     
     def get_control_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -190,10 +262,7 @@ class UnicycleModel(DynamicsModel):
         Returns:
             (u_min, u_max) arrays
         """
-        return (
-            np.array([self.v_min, self.omega_min]),
-            np.array([self.v_max, self.omega_max])
-        )
+        return self.control_bounds()
 
 
 class ControlParameterization:
@@ -241,6 +310,31 @@ class ControlParameterization:
         if weight_sum <= 1e-12:
             return weights
         return weights / weight_sum
+
+    def _boundary_segment_control_numpy(self, tau: float, w: np.ndarray) -> Optional[np.ndarray]:
+        """Return exact endpoint controls for Python numeric boundary times."""
+        if self.parameterization != "piecewise_constant":
+            return None
+        if tau <= 0.0:
+            return self.get_segment_control(w, 0)
+        if tau >= 1.0:
+            return self.get_segment_control(w, self.n_segments - 1)
+        return None
+
+    def _boundary_segment_control_casadi(self, tau, w: ca.MX) -> Optional[ca.MX]:
+        """Return exact endpoint controls when CasADi evaluation receives a Python scalar."""
+        if self.parameterization != "piecewise_constant":
+            return None
+        if not isinstance(tau, (int, float, np.floating)):
+            return None
+
+        tau_float = float(tau)
+        if tau_float <= 0.0:
+            return w[:self.n_u]
+        if tau_float >= 1.0:
+            start_idx = (self.n_segments - 1) * self.n_u
+            return w[start_idx:start_idx + self.n_u]
+        return None
     
     def evaluate(self, tau: float, w: np.ndarray) -> np.ndarray:
         """
@@ -257,9 +351,14 @@ class ControlParameterization:
             return w[:self.n_u]
         
         elif self.parameterization == "piecewise_constant":
+            tau_float = float(tau)
+            endpoint_control = self._boundary_segment_control_numpy(tau_float, w)
+            if endpoint_control is not None:
+                return endpoint_control
+
             result = np.zeros(self.n_u, dtype=np.float64)
             weights = self._normalize_weights_numpy(
-                self._smooth_segment_weights_numpy(float(tau))
+                self._smooth_segment_weights_numpy(tau_float)
             )
 
             for seg, weight in enumerate(weights):
@@ -283,6 +382,10 @@ class ControlParameterization:
             return w[:self.n_u]
         
         elif self.parameterization == "piecewise_constant":
+            endpoint_control = self._boundary_segment_control_casadi(tau, w)
+            if endpoint_control is not None:
+                return endpoint_control
+
             # Use weighted combination with soft switching
             # This is an approximation for optimization purposes
             result = ca.MX.zeros(self.n_u)
@@ -350,24 +453,17 @@ class RK4Integrator:
             Final state (exit state)
         """
         x = s_minus.copy()
-        
+
         for i in range(self.n_steps):
-            tau = i * self.dt
-            tau_mid = tau + 0.5 * self.dt
-            tau_end = tau + self.dt
-            
-            # Control at different points
-            u_start = self.control_param.evaluate(tau, w)
-            u_mid = self.control_param.evaluate(tau_mid, w)
-            u_end = self.control_param.evaluate(tau_end, w)
-            
-            # RK4 stages (scaled by delta for time transformation)
-            k1 = delta * self.dynamics.f(x, u_start)
-            k2 = delta * self.dynamics.f(x + 0.5 * self.dt * k1, u_mid)
-            k3 = delta * self.dynamics.f(x + 0.5 * self.dt * k2, u_mid)
-            k4 = delta * self.dynamics.f(x + self.dt * k3, u_end)
-            
-            x = x + (self.dt / 6) * (k1 + 2*k2 + 2*k3 + k4)
+            x = _rk4_step_numpy(
+                self.dynamics,
+                self.control_param,
+                x,
+                w,
+                delta,
+                i * self.dt,
+                self.dt,
+            )
         
         return x
     
@@ -385,25 +481,21 @@ class RK4Integrator:
         tau_values = [0.0]
         
         x = s_minus.copy()
-        
+
         for i in range(self.n_steps):
             tau = i * self.dt
-            tau_mid = tau + 0.5 * self.dt
-            tau_end = tau + self.dt
-            
-            u_start = self.control_param.evaluate(tau, w)
-            u_mid = self.control_param.evaluate(tau_mid, w)
-            u_end = self.control_param.evaluate(tau_end, w)
-            
-            k1 = delta * self.dynamics.f(x, u_start)
-            k2 = delta * self.dynamics.f(x + 0.5 * self.dt * k1, u_mid)
-            k3 = delta * self.dynamics.f(x + 0.5 * self.dt * k2, u_mid)
-            k4 = delta * self.dynamics.f(x + self.dt * k3, u_end)
-            
-            x = x + (self.dt / 6) * (k1 + 2*k2 + 2*k3 + k4)
+            x = _rk4_step_numpy(
+                self.dynamics,
+                self.control_param,
+                x,
+                w,
+                delta,
+                tau,
+                self.dt,
+            )
             
             trajectory.append(x.copy())
-            tau_values.append(tau_end)
+            tau_values.append(tau + self.dt)
         
         return np.array(trajectory), np.array(tau_values)
     
@@ -441,7 +533,89 @@ class RK4Integrator:
         return mesh_states
 
 
-def create_casadi_integrator(dynamics: DynamicsModel, 
+@dataclass(frozen=True)
+class CasADiIntegrationBundle:
+    """Shared CasADi functions for one dynamics/control transcription."""
+
+    F_endpoint: Callable
+    mesh_sampler: Callable
+    cbf_sampler: Callable
+    local_cost_fn: Callable
+
+
+def _rk4_step_numpy(dynamics: DynamicsModel,
+                    control_param: ControlParameterization,
+                    x: np.ndarray,
+                    w: np.ndarray,
+                    delta: float,
+                    tau: float,
+                    dt: float) -> np.ndarray:
+    """One normalized-time RK4 step for NumPy evaluation."""
+    tau_mid = tau + 0.5 * dt
+    tau_end = tau + dt
+
+    u_start = control_param.evaluate(tau, w)
+    u_mid = control_param.evaluate(tau_mid, w)
+    u_end = control_param.evaluate(tau_end, w)
+
+    k1 = delta * dynamics.f(x, u_start)
+    k2 = delta * dynamics.f(x + 0.5 * dt * k1, u_mid)
+    k3 = delta * dynamics.f(x + 0.5 * dt * k2, u_mid)
+    k4 = delta * dynamics.f(x + dt * k3, u_end)
+
+    return x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+
+def _rk4_step_casadi(dynamics: DynamicsModel,
+                     control_param: ControlParameterization,
+                     x: ca.MX,
+                     w: ca.MX,
+                     delta: ca.MX,
+                     tau: float,
+                     dt: float) -> ca.MX:
+    """One normalized-time RK4 step for CasADi graph construction."""
+    tau_mid = tau + 0.5 * dt
+    tau_end = tau + dt
+
+    u_start = control_param.evaluate_casadi(tau, w)
+    u_mid = control_param.evaluate_casadi(tau_mid, w)
+    u_end = control_param.evaluate_casadi(tau_end, w)
+
+    k1 = delta * dynamics.f_casadi(x, u_start)
+    k2 = delta * dynamics.f_casadi(x + 0.5 * dt * k1, u_mid)
+    k3 = delta * dynamics.f_casadi(x + 0.5 * dt * k2, u_mid)
+    k4 = delta * dynamics.f_casadi(x + dt * k3, u_end)
+
+    return x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+
+def _casadi_trajectory_states(dynamics: DynamicsModel,
+                              control_param: ControlParameterization,
+                              s_minus: ca.MX,
+                              w: ca.MX,
+                              delta: ca.MX,
+                              n_steps: int) -> List[ca.MX]:
+    """Build CasADi state expressions at every RK4 grid point."""
+    dt = 1.0 / n_steps
+    x = s_minus
+    trajectory = [x]
+
+    for i in range(n_steps):
+        x = _rk4_step_casadi(
+            dynamics,
+            control_param,
+            x,
+            w,
+            delta,
+            i * dt,
+            dt,
+        )
+        trajectory.append(x)
+
+    return trajectory
+
+
+def create_casadi_integrator(dynamics: DynamicsModel,
                              control_param: ControlParameterization,
                              n_steps: int = 20) -> Callable:
     """
@@ -455,26 +629,9 @@ def create_casadi_integrator(dynamics: DynamicsModel,
     w = ca.MX.sym('w', control_param.n_w)
     delta = ca.MX.sym('delta', 1)
     
-    dt = 1.0 / n_steps
-    x = s_minus
-    
-    for i in range(n_steps):
-        tau = i * dt
-        tau_mid = tau + 0.5 * dt
-        tau_end = tau + dt
-        
-        u_start = control_param.evaluate_casadi(tau, w)
-        u_mid = control_param.evaluate_casadi(tau_mid, w)
-        u_end = control_param.evaluate_casadi(tau_end, w)
-        
-        k1 = delta * dynamics.f_casadi(x, u_start)
-        k2 = delta * dynamics.f_casadi(x + 0.5 * dt * k1, u_mid)
-        k3 = delta * dynamics.f_casadi(x + 0.5 * dt * k2, u_mid)
-        k4 = delta * dynamics.f_casadi(x + dt * k3, u_end)
-        
-        x = x + (dt / 6) * (k1 + 2*k2 + 2*k3 + k4)
-    
-    s_plus = x
+    s_plus = _casadi_trajectory_states(
+        dynamics, control_param, s_minus, w, delta, n_steps
+    )[-1]
     
     # Create function
     F = ca.Function('endpoint_map', [s_minus, w, delta], [s_plus],
@@ -582,28 +739,9 @@ def create_casadi_trajectory_sampler(dynamics: DynamicsModel,
     w = ca.MX.sym('w', control_param.n_w)
     delta = ca.MX.sym('delta', 1)
     
-    dt = 1.0 / n_steps
-    
-    # Store trajectory at all RK4 steps
-    trajectory = [s_minus]
-    x = s_minus
-    
-    for i in range(n_steps):
-        tau = i * dt
-        tau_mid = tau + 0.5 * dt
-        tau_end = tau + dt
-        
-        u_start = control_param.evaluate_casadi(tau, w)
-        u_mid = control_param.evaluate_casadi(tau_mid, w)
-        u_end = control_param.evaluate_casadi(tau_end, w)
-        
-        k1 = delta * dynamics.f_casadi(x, u_start)
-        k2 = delta * dynamics.f_casadi(x + 0.5 * dt * k1, u_mid)
-        k3 = delta * dynamics.f_casadi(x + 0.5 * dt * k2, u_mid)
-        k4 = delta * dynamics.f_casadi(x + dt * k3, u_end)
-        
-        x = x + (dt / 6) * (k1 + 2*k2 + 2*k3 + k4)
-        trajectory.append(x)
+    trajectory = _casadi_trajectory_states(
+        dynamics, control_param, s_minus, w, delta, n_steps
+    )
     
     # Sample at mesh points using linear interpolation
     mesh_tau = np.linspace(0, 1, n_mesh)
@@ -631,3 +769,134 @@ def create_casadi_trajectory_sampler(dynamics: DynamicsModel,
                    ['s_minus', 'w', 'delta'], ['mesh_positions'])
     
     return F
+
+
+def create_casadi_cbf_sampler(dynamics: DynamicsModel,
+                              control_param: ControlParameterization,
+                              n_steps: int = 20,
+                              n_mesh: int = 10) -> Callable:
+    """
+    Create CasADi function returning mesh positions and physical velocities.
+
+    Returns:
+        Function(s_minus, w, delta) -> (positions, velocities), each with shape
+        (n_mesh, n_pos). Velocities are dq/dt, not normalized by Delta.
+    """
+    s_minus = ca.MX.sym('s_minus', dynamics.n_x)
+    w = ca.MX.sym('w', control_param.n_w)
+    delta = ca.MX.sym('delta', 1)
+
+    trajectory = _casadi_trajectory_states(
+        dynamics, control_param, s_minus, w, delta, n_steps
+    )
+
+    mesh_tau = np.linspace(0, 1, n_mesh)
+    tau_vals = np.linspace(0, 1, n_steps + 1)
+
+    mesh_positions = []
+    mesh_velocities = []
+    for tau in mesh_tau:
+        idx = min(int(tau * n_steps), n_steps - 1)
+
+        t0, t1 = tau_vals[idx], tau_vals[idx + 1]
+        alpha = (tau - t0) / (t1 - t0 + 1e-12)
+        state = (1 - alpha) * trajectory[idx] + alpha * trajectory[idx + 1]
+
+        control = control_param.evaluate_casadi(float(tau), w)
+        pos = dynamics.project_to_position_casadi(state)
+        vel = dynamics.position_velocity_casadi(state, control)
+        mesh_positions.append(pos)
+        mesh_velocities.append(vel)
+
+    position_matrix = ca.hcat(mesh_positions).T
+    velocity_matrix = ca.hcat(mesh_velocities).T
+
+    return ca.Function(
+        'trajectory_cbf_mesh',
+        [s_minus, w, delta],
+        [position_matrix, velocity_matrix],
+        ['s_minus', 'w', 'delta'],
+        ['mesh_positions', 'mesh_velocities'],
+    )
+
+
+def create_casadi_local_cost(dynamics: DynamicsModel,
+                             control_param: ControlParameterization,
+                             n_steps: int = 20) -> Callable:
+    """
+    Create CasADi function for local cost computation.
+
+    J_v = a * Delta
+        + integral[w_L * ||q_dot||^2 + w_E * ||u||^2] dtau
+        + w_u_smooth * sum_k ||u_{k+1} - u_k||^2
+    """
+    s_minus = ca.MX.sym('s_minus', dynamics.n_x)
+    w = ca.MX.sym('w', control_param.n_w)
+    delta = ca.MX.sym('delta', 1)
+    a = ca.MX.sym('a', 1)
+    w_L = ca.MX.sym('w_L', 1)
+    w_E = ca.MX.sym('w_E', 1)
+    w_u_smooth = ca.MX.sym('w_u_smooth', 1)
+
+    dt = 1.0 / n_steps
+    cost = a * delta
+    x = s_minus
+
+    for i in range(n_steps):
+        tau = i * dt
+        tau_end = tau + dt
+
+        u_start = control_param.evaluate_casadi(tau, w)
+        u_end = control_param.evaluate_casadi(tau_end, w)
+
+        x_next = _rk4_step_casadi(
+            dynamics,
+            control_param,
+            x,
+            w,
+            delta,
+            tau,
+            dt,
+        )
+
+        q_dot_start = dynamics.position_velocity_casadi(x, u_start)
+        q_dot_end = dynamics.position_velocity_casadi(x_next, u_end)
+        running_start = w_L * ca.dot(q_dot_start, q_dot_start) + w_E * ca.dot(u_start, u_start)
+        running_end = w_L * ca.dot(q_dot_end, q_dot_end) + w_E * ca.dot(u_end, u_end)
+
+        cost = cost + delta * dt * 0.5 * (running_start + running_end)
+        x = x_next
+
+    if control_param.n_segments > 1:
+        for seg in range(control_param.n_segments - 1):
+            start_left = seg * control_param.n_u
+            start_right = (seg + 1) * control_param.n_u
+            u_left = w[start_left:start_left + control_param.n_u]
+            u_right = w[start_right:start_right + control_param.n_u]
+            diff = u_right - u_left
+            cost = cost + w_u_smooth * ca.dot(diff, diff)
+
+    return ca.Function(
+        'local_cost',
+        [s_minus, w, delta, a, w_L, w_E, w_u_smooth],
+        [cost],
+        ['s_minus', 'w', 'delta', 'a', 'w_L', 'w_E', 'w_u_smooth'],
+        ['cost'],
+    )
+
+
+def create_integration_bundle(dynamics: DynamicsModel,
+                              control_param: ControlParameterization,
+                              n_steps: int = 20,
+                              n_mesh: int = 10) -> CasADiIntegrationBundle:
+    """Build all CasADi functions used by one optimizer transcription."""
+    return CasADiIntegrationBundle(
+        F_endpoint=create_casadi_integrator(dynamics, control_param, n_steps),
+        mesh_sampler=create_casadi_trajectory_sampler(
+            dynamics, control_param, n_steps, n_mesh
+        ),
+        cbf_sampler=create_casadi_cbf_sampler(
+            dynamics, control_param, n_steps, n_mesh
+        ),
+        local_cost_fn=create_casadi_local_cost(dynamics, control_param, n_steps),
+    )

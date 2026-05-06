@@ -21,6 +21,7 @@ from convex_regions import ConvexRegion, create_buffered_regions_from_vertices_l
 from dynamics import UnicycleModel
 from environment import Environment, create_environment_from_vertices
 from graph_builder import RegionGraph, build_region_graph
+from graph_types import region_node_label
 from optimizer import IntegratedMIOCPSolver, create_integrated_optimizer_from_config
 from problem_data import PROBLEM_PRESETS, ProblemPresetSpec
 
@@ -58,7 +59,9 @@ def get_problem_preset(name: str) -> ProblemPresetSpec:
         raise ValueError(f"Unknown problem preset '{name}'. Available: {available}") from exc
 
 
-def build_environment_and_regions(preset: ProblemPresetSpec) -> tuple[Environment, List[ConvexRegion]]:
+def build_environment_and_regions(
+    preset: ProblemPresetSpec,
+) -> tuple[Environment, List[ConvexRegion], List[ConvexRegion]]:
     """Construct environment and convex regions from a preset."""
     environment = create_environment_from_vertices(
         preset.workspace_vertices,
@@ -91,9 +94,13 @@ def build_environment_and_regions(preset: ProblemPresetSpec) -> tuple[Environmen
 
     print(f"Built environment with {len(environment.obstacles)} obstacles and {len(region_vertices)} regions")
 
-    regions = create_buffered_regions_from_vertices_list(region_vertices, preset.workspace_vertices,buffer_size=0.001)
-    # regions = create_regions_from_vertices_list(region_vertices)
-    return environment, regions
+    adjacency_regions = create_regions_from_vertices_list(region_vertices)
+    regions = create_buffered_regions_from_vertices_list(
+        region_vertices,
+        preset.workspace_vertices,
+        buffer_size=0.001,
+    )
+    return environment, regions, adjacency_regions
 
 
 def _select_region_subset(regions: List[ConvexRegion],
@@ -106,7 +113,7 @@ def _select_region_subset(regions: List[ConvexRegion],
 
     for index, region in enumerate(selected):
         region.index = index
-        region.label = f"R{index}"
+        region.label = region_node_label(index)
 
     return selected
 
@@ -115,8 +122,12 @@ def prepare_scenario(config: DemoConfig, scenario_name: str) -> PreparedScenario
     """Build all runtime objects needed to solve one scenario."""
     resolved = config.resolve_scenario(scenario_name)
     preset = get_problem_preset(resolved.problem_preset)
-    environment, all_regions = build_environment_and_regions(preset)
+    environment, all_regions, all_adjacency_regions = build_environment_and_regions(preset)
     regions = _select_region_subset(all_regions, resolved.active_region_indices)
+    adjacency_regions = _select_region_subset(
+        all_adjacency_regions,
+        resolved.active_region_indices,
+    )
 
     dyn_cfg = resolved.runtime_config.get("dynamics", {})
     dynamics = UnicycleModel(
@@ -126,7 +137,12 @@ def prepare_scenario(config: DemoConfig, scenario_name: str) -> PreparedScenario
         omega_max=dyn_cfg.get("omega_max", np.pi),
     )
 
-    graph = build_region_graph(regions, resolved.start_state[:2], resolved.goal_state[:2])
+    graph = build_region_graph(
+        regions,
+        resolved.start_state[:2],
+        resolved.goal_state[:2],
+        adjacency_regions=adjacency_regions,
+    )
     optimizer = create_integrated_optimizer_from_config(graph, dynamics, resolved.runtime_config)
 
     return PreparedScenario(

@@ -21,6 +21,7 @@ import textwrap
 
 from convex_regions import ConvexRegion
 from graph_builder import RegionGraph, SOURCE, TARGET
+from graph_types import is_region_node_id, region_index_from_node_id, region_node_label
 from optimizer import OptimizationResult
 
 
@@ -134,6 +135,92 @@ def _polygon_vertices(polygon_like) -> np.ndarray:
     return np.asarray(polygon_like, dtype=np.float64)
 
 
+def _draw_geometry_lines(ax, geometry, *, color: str, linewidth: float,
+                         linestyle: str, zorder: int) -> None:
+    """Draw LineString/MultiLineString/Polygon-like shapely geometries."""
+    if geometry is None or geometry.is_empty:
+        return
+
+    geom_type = geometry.geom_type
+    if geom_type == "LineString":
+        coords = np.asarray(geometry.coords, dtype=np.float64)
+        if len(coords) >= 2:
+            ax.plot(
+                coords[:, 0],
+                coords[:, 1],
+                color=color,
+                linewidth=linewidth,
+                linestyle=linestyle,
+                solid_capstyle="round",
+                dash_capstyle="round",
+                zorder=zorder,
+            )
+        return
+
+    if geom_type == "Polygon":
+        coords = np.asarray(geometry.exterior.coords, dtype=np.float64)
+        ax.plot(
+            coords[:, 0],
+            coords[:, 1],
+            color=color,
+            linewidth=linewidth,
+            linestyle=linestyle,
+            solid_capstyle="round",
+            dash_capstyle="round",
+            zorder=zorder,
+        )
+        return
+
+    if hasattr(geometry, "geoms"):
+        for part in geometry.geoms:
+            _draw_geometry_lines(
+                ax,
+                part,
+                color=color,
+                linewidth=linewidth,
+                linestyle=linestyle,
+                zorder=zorder,
+            )
+
+
+def _draw_shared_region_edges(ax,
+                              regions: List[ConvexRegion],
+                              highlight_regions: List[int]) -> None:
+    """Highlight shared boundaries/interfaces between consecutive path regions."""
+    region_by_index = {region.index: region for region in regions}
+
+    for left_idx, right_idx in zip(highlight_regions[:-1], highlight_regions[1:]):
+        left_region = region_by_index.get(left_idx)
+        right_region = region_by_index.get(right_idx)
+        if left_region is None or right_region is None:
+            continue
+
+        left_poly = left_region.get_shapely_polygon()
+        right_poly = right_region.get_shapely_polygon()
+        boundary_intersection = left_poly.boundary.intersection(right_poly.boundary)
+        if not boundary_intersection.is_empty and boundary_intersection.length > 1e-9:
+            _draw_geometry_lines(
+                ax,
+                boundary_intersection,
+                color="#ff8c00",
+                linewidth=2.3,
+                linestyle="--",
+                zorder=9,
+            )
+            continue
+
+        overlap = left_poly.intersection(right_poly)
+        if not overlap.is_empty:
+            _draw_geometry_lines(
+                ax,
+                overlap,
+                color="#ff8c00",
+                linewidth=2.0,
+                linestyle="--",
+                zorder=9,
+            )
+
+
 def plot_environment(ax, workspace_bounds: Tuple[float, float, float, float],
                      regions: List[ConvexRegion],
                      start_pos: np.ndarray, goal_pos: np.ndarray,
@@ -165,6 +252,7 @@ def plot_environment(ax, workspace_bounds: Tuple[float, float, float, float],
     )
     ax.add_patch(workspace_rect)
     
+<<<<<<< HEAD
     # Colormap for regions. Keep non-path regions quiet so the path reads first.
     cmap = plt.cm.get_cmap('tab20')
     highlight_set = set(highlight_regions or [])
@@ -184,12 +272,35 @@ def plot_environment(ax, workspace_bounds: Tuple[float, float, float, float],
             face_alpha = alpha
             edge_width = 0.8
             edge_color = '#b8c0c8'
+=======
+    # Colormap for regions
+    cmap = plt.cm.get_cmap('tab10')
+    use_path_style = highlight_regions is not None
+    highlight_region_set = set(highlight_regions or [])
+    selected_face = "#b8dcff"
+    selected_edge = "#005ea8"
+    
+    # Plot regions
+    for region in regions:
+        color = cmap(region.index % 10)
+        is_highlighted = region.index in highlight_region_set
+        
+        if use_path_style:
+            face_color = to_rgba(selected_face, 0.36) if is_highlighted else "none"
+            edge_width = 2.8 if is_highlighted else 0.9
+            edge_color = selected_edge if is_highlighted else "#d0d0d0"
+            zorder = 3 if is_highlighted else 1
+        else:
+            face_color = to_rgba(color, alpha)
+            edge_width = 1.0
+            edge_color = color
+>>>>>>> a803b86 (Add comprehensive unit tests for various components)
             zorder = 1
         
         poly = patches.Polygon(
             region.vertices,
             closed=True,
-            facecolor=(*color[:3], face_alpha),
+            facecolor=face_color,
             edgecolor=edge_color,
             linewidth=edge_width,
             zorder=zorder,
@@ -199,26 +310,47 @@ def plot_environment(ax, workspace_bounds: Tuple[float, float, float, float],
         # Label
         if show_region_labels or region.index in highlight_set:
             centroid = region.get_centroid()
+            label_color = "#003f73" if is_highlighted else ("#7a7a7a" if use_path_style else "black")
             ax.text(centroid[0], centroid[1], f'R{region.index}',
+<<<<<<< HEAD
                    ha='center', va='center',
                    fontsize=8 if len(regions) <= max_labeled_regions else 7,
                    color='#0D47A1' if region.index in highlight_set else '#455A64',
                    fontweight='bold' if region.index in highlight_set else 'normal',
                    zorder=5)
+=======
+                    ha='center', va='center',
+                    fontsize=8.5 if is_highlighted else 7.5 if use_path_style else 8,
+                    color=label_color,
+                    zorder=10,
+                    fontweight='bold' if is_highlighted else 'normal')
+>>>>>>> a803b86 (Add comprehensive unit tests for various components)
 
     # Overlay obstacles explicitly so blocked space is easy to see.
     for obstacle_idx, obstacle in enumerate(obstacles or []):
         obstacle_patch = patches.Polygon(
             _polygon_vertices(obstacle),
             closed=True,
+<<<<<<< HEAD
             facecolor='#404040',
             edgecolor='#ffffff',
             linewidth=1.0,
             alpha=0.95,
             zorder=4,
+=======
+            facecolor='#111111',
+            edgecolor='#111111',
+            linewidth=2.2,
+            joinstyle='miter',
+            alpha=1.0,
+            zorder=6,
+>>>>>>> a803b86 (Add comprehensive unit tests for various components)
             label='Obstacle' if obstacle_idx == 0 else None,
         )
         ax.add_patch(obstacle_patch)
+
+    if use_path_style:
+        _draw_shared_region_edges(ax, regions, list(highlight_regions or []))
 
     # Plot start and goal
     ax.scatter(start_pos[0], start_pos[1], s=150, marker='o',
@@ -238,10 +370,11 @@ def plot_environment(ax, workspace_bounds: Tuple[float, float, float, float],
 
 
 def _collect_mesh_points(result: OptimizationResult,
-                         fallback_points_per_segment: int = 5
+                         fallback_points_per_segment: int = 5,
+                         include_endpoints: bool = True,
                          ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Collect interior mesh points and their physical times.
+    Collect mesh sample points and their physical times.
 
     Uses exact solver mesh samples when available, with a trajectory-based
     fallback for older results.
@@ -252,18 +385,24 @@ def _collect_mesh_points(result: OptimizationResult,
 
     if result.mesh_samples:
         for mesh_positions, mesh_tau, delta in result.mesh_samples:
-            if len(mesh_positions) > 2:
-                for idx in range(1, len(mesh_positions) - 1):
+            if len(mesh_positions) > 0:
+                if include_endpoints:
+                    indices = range(len(mesh_positions))
+                else:
+                    indices = range(1, max(1, len(mesh_positions) - 1))
+                for idx in indices:
                     mesh_points.append(mesh_positions[idx])
                     mesh_times.append(cumulative_time + mesh_tau[idx] * delta)
             cumulative_time += delta
     else:
         for traj, tau, delta in result.trajectories:
             sample_count = min(fallback_points_per_segment, len(traj))
-            if sample_count > 2:
+            if sample_count > 0:
                 indices = np.linspace(0, len(traj) - 1, sample_count, dtype=int)
                 indices = np.unique(indices)
-                for idx in indices[1:-1]:
+                if not include_endpoints:
+                    indices = indices[1:-1] if len(indices) > 2 else []
+                for idx in indices:
                     mesh_points.append(traj[idx, :2])
                     mesh_times.append(cumulative_time + tau[idx] * delta)
             cumulative_time += delta
@@ -334,6 +473,14 @@ def plot_trajectory(ax, result: OptimizationResult, regions: List[ConvexRegion],
                             head_length=0.04, fc='#0D47A1', ec='#0D47A1',
                             alpha=0.72, zorder=7, length_includes_head=True)
     
+    # Mesh points: show all configured n_mesh_points for each selected region.
+    if show_mesh_points:
+        mesh_pts, _ = _collect_mesh_points(result)
+        if len(mesh_pts) > 0:
+            ax.scatter(mesh_pts[:, 0], mesh_pts[:, 1],
+                      c='#9C27B0', s=38, marker='x', zorder=9,
+                      linewidths=1.5, alpha=0.9, label='Mesh Points')
+
     # Interface points
     if show_interface_points and result.interface_points:
         interface_pts = np.array(result.interface_points)
@@ -341,6 +488,7 @@ def plot_trajectory(ax, result: OptimizationResult, regions: List[ConvexRegion],
                   c='#F57C00', s=76, marker='D', zorder=8,
                   edgecolors='white', linewidths=1.2,
                   label='Interface Points')
+<<<<<<< HEAD
     
     # Mesh points (sample from trajectories)
     if show_mesh_points:
@@ -350,6 +498,8 @@ def plot_trajectory(ax, result: OptimizationResult, regions: List[ConvexRegion],
                       c='#7B1FA2', s=24, marker='o', zorder=7,
                       alpha=0.72, edgecolors='white', linewidths=0.35,
                       label='Mesh Points')
+=======
+>>>>>>> a803b86 (Add comprehensive unit tests for various components)
 
 
 def plot_graph_structure(ax, graph: RegionGraph, 
@@ -370,7 +520,7 @@ def plot_graph_structure(ax, graph: RegionGraph,
     pos[TARGET] = graph.goal_pos
     
     for region in graph.regions:
-        node_id = f"R{region.index}"
+        node_id = region_node_label(region.index)
         pos[node_id] = region.get_centroid()
     
     # Draw edges
@@ -486,8 +636,8 @@ def create_result_figure(result: OptimizationResult, graph: RegionGraph,
 
     path_labels = []
     for node_id in result.path:
-        if node_id.startswith("R"):
-            region_idx = int(node_id[1:])
+        if is_region_node_id(node_id):
+            region_idx = region_index_from_node_id(node_id)
             delta = result.time_durations.get(region_idx)
             if delta is not None:
                 path_labels.append(f"{node_id} [{delta:.2f}s]")

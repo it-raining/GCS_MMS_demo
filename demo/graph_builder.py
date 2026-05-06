@@ -14,11 +14,13 @@ from typing import List, Dict, Tuple, Optional, Set
 from dataclasses import dataclass, field
 
 from convex_regions import ConvexRegion, regions_intersect, compute_intersection
-
-
-# Special node identifiers
-SOURCE = "source"
-TARGET = "target"
+from graph_types import (
+    SOURCE,
+    TARGET,
+    is_terminal_node_id,
+    region_index_from_node_id,
+    region_node_label,
+)
 
 
 @dataclass
@@ -48,19 +50,41 @@ class RegionGraph:
         source_edges: List of edges from source
         target_edges: List of edges to target
         region_edges: List of inter-region edges
+        adjacency_regions: Optional unbuffered regions used only to decide
+            region-region graph connectivity and interface anchors. If omitted,
+            `regions` are used for both optimization geometry and adjacency.
         intersections: Dict mapping edge tuple to intersection region
     """
     regions: List[ConvexRegion]
     start_pos: np.ndarray
     goal_pos: np.ndarray
+    adjacency_regions: Optional[List[ConvexRegion]] = None
     graph: nx.DiGraph = field(default_factory=nx.DiGraph)
     source_edges: List[Tuple[str, str]] = field(default_factory=list)
     target_edges: List[Tuple[str, str]] = field(default_factory=list)
     region_edges: List[Tuple[str, str]] = field(default_factory=list)
     intersections: Dict[Tuple[str, str], ConvexRegion] = field(default_factory=dict)
+    _regions_by_index: Dict[int, ConvexRegion] = field(default_factory=dict, init=False, repr=False)
+    _adjacency_regions: List[ConvexRegion] = field(default_factory=list, init=False, repr=False)
     
     def __post_init__(self):
         """Build the graph after initialization."""
+        self._regions_by_index = {}
+        for region in self.regions:
+            if region.index in self._regions_by_index:
+                raise ValueError(f"Duplicate region index in graph: {region.index}")
+            self._regions_by_index[region.index] = region
+
+        if self.adjacency_regions is None:
+            self._adjacency_regions = self.regions
+        else:
+            if len(self.adjacency_regions) != len(self.regions):
+                raise ValueError(
+                    "adjacency_regions must have the same length as regions "
+                    f"({len(self.adjacency_regions)} != {len(self.regions)})"
+                )
+            self._adjacency_regions = self.adjacency_regions
+
         self._build_graph()
     
     def _build_graph(self):
@@ -71,7 +95,7 @@ class RegionGraph:
         
         # Add region nodes
         for region in self.regions:
-            node_id = f"R{region.index}"
+            node_id = region_node_label(region.index)
             self.graph.add_node(node_id, 
                                node_type='region',
                                region=region,
@@ -80,30 +104,35 @@ class RegionGraph:
         # Add source edges (source -> v for v containing start)
         for region in self.regions:
             if region.contains(self.start_pos, margin=0):
-                node_id = f"R{region.index}"
+                node_id = region_node_label(region.index)
                 self.graph.add_edge(SOURCE, node_id, edge_type='source')
                 self.source_edges.append((SOURCE, node_id))
         
         # Add target edges (v -> target for v containing goal)
         for region in self.regions:
             if region.contains(self.goal_pos, margin=0):
-                node_id = f"R{region.index}"
+                node_id = region_node_label(region.index)
                 self.graph.add_edge(node_id, TARGET, edge_type='target')
                 self.target_edges.append((node_id, TARGET))
         
-        # Add inter-region edges (u -> v if Q_u and Q_v share an edge or overlap)
+        # Add inter-region edges (u -> v if Q_u and Q_v share an edge or overlap).
+        # Connectivity may be evaluated on unbuffered adjacency regions so tiny
+        # artificial overlaps created only by solver buffers do not create edges.
         n = len(self.regions)
         for i in range(n):
             for j in range(n):
                 if i == j:
                     continue
                 
-                if regions_intersect(self.regions[i], self.regions[j]):
-                    u_id = f"R{i}"
-                    v_id = f"R{j}"
+                if regions_intersect(self._adjacency_regions[i], self._adjacency_regions[j]):
+                    u_id = region_node_label(self.regions[i].index)
+                    v_id = region_node_label(self.regions[j].index)
                     
                     # Compute intersection for interface constraints
-                    intersection = compute_intersection(self.regions[i], self.regions[j])
+                    intersection = compute_intersection(
+                        self._adjacency_regions[i],
+                        self._adjacency_regions[j],
+                    )
                     
                     self.graph.add_edge(u_id, v_id, 
                                        edge_type='region',
@@ -115,14 +144,17 @@ class RegionGraph:
     
     def get_region_by_id(self, node_id: str) -> Optional[ConvexRegion]:
         """Get ConvexRegion object by node ID."""
-        if node_id in [SOURCE, TARGET]:
+        if is_terminal_node_id(node_id):
             return None
-        idx = int(node_id[1:])  # Remove 'R' prefix
-        return self.regions[idx]
+        idx = region_index_from_node_id(node_id)
+        try:
+            return self._regions_by_index[idx]
+        except KeyError as exc:
+            raise KeyError(f"Unknown region node ID {node_id!r}") from exc
     
     def get_region_nodes(self) -> List[str]:
         """Get list of region node IDs (excluding source/target)."""
-        return [f"R{r.index}" for r in self.regions]
+        return [region_node_label(r.index) for r in self.regions]
     
     def get_source_regions(self) -> List[str]:
         """Get regions connected to source."""
@@ -165,7 +197,7 @@ class RegionGraph:
         """
         regions = []
         for node_id in path:
-            if node_id not in [SOURCE, TARGET]:
+            if not is_terminal_node_id(node_id):
                 regions.append(self.get_region_by_id(node_id))
         return regions
     
@@ -219,7 +251,8 @@ class RegionGraph:
 
 def build_region_graph(regions: List[ConvexRegion], 
                        start_pos: np.ndarray,
-                       goal_pos: np.ndarray) -> RegionGraph:
+                       goal_pos: np.ndarray,
+                       adjacency_regions: Optional[List[ConvexRegion]] = None) -> RegionGraph:
     """
     Build region graph from convex regions and start/goal positions.
     
@@ -227,6 +260,9 @@ def build_region_graph(regions: List[ConvexRegion],
         regions: List of ConvexRegion objects
         start_pos: 2D start position
         goal_pos: 2D goal position
+        adjacency_regions: Optional regions used for region-region adjacency.
+            This is useful when optimization uses buffered regions but graph
+            topology should be determined by the original unbuffered geometry.
         
     Returns:
         RegionGraph object
@@ -234,7 +270,8 @@ def build_region_graph(regions: List[ConvexRegion],
     return RegionGraph(
         regions=regions,
         start_pos=start_pos,
-        goal_pos=goal_pos
+        goal_pos=goal_pos,
+        adjacency_regions=adjacency_regions,
     )
 
 
@@ -256,7 +293,7 @@ def visualize_graph_structure(graph: RegionGraph, filename: Optional[str] = None
     pos[TARGET] = graph.goal_pos
     
     for region in graph.regions:
-        node_id = f"R{region.index}"
+        node_id = region_node_label(region.index)
         pos[node_id] = region.get_centroid()
     
     # Draw nodes

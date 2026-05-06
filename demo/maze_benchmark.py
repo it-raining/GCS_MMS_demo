@@ -29,10 +29,11 @@ from shapely.ops import unary_union
 
 from acd2d.acd2d import ACD2D
 from app_config import DemoConfig
-from convex_regions import create_buffered_regions_from_vertices_list
+from convex_regions import create_buffered_regions_from_vertices_list, create_regions_from_vertices_list
 from dynamics import UnicycleModel
 from environment import create_environment_from_vertices
 from graph_builder import build_region_graph
+from graph_types import region_node_label
 from models.maze import Maze
 from optimizer import create_integrated_optimizer_from_config
 from problem_data import PROBLEM_PRESETS
@@ -312,11 +313,11 @@ def _save_environment_debug_plot(
         obstacle_patch = patches.Polygon(
             polygon,
             closed=True,
-            facecolor="#404040",
+            facecolor="#111111",
             edgecolor="#111111",
-            linewidth=1.0,
-            alpha=0.9,
-            hatch="///",
+            linewidth=2.2,
+            joinstyle="miter",
+            alpha=1.0,
         )
         ax.add_patch(obstacle_patch)
 
@@ -383,7 +384,7 @@ def _save_region_debug_plot(
         ax.text(
             centroid[0],
             centroid[1],
-            f"R{region.index}",
+            region_node_label(region.index),
             ha="center",
             va="center",
             fontsize=6,
@@ -397,11 +398,11 @@ def _save_region_debug_plot(
         obstacle_patch = patches.Polygon(
             polygon,
             closed=True,
-            facecolor="#2f2f2f",
-            edgecolor="#0f0f0f",
-            linewidth=1.0,
-            alpha=0.9,
-            hatch="///",
+            facecolor="#111111",
+            edgecolor="#111111",
+            linewidth=2.2,
+            joinstyle="miter",
+            alpha=1.0,
         )
         ax.add_patch(obstacle_patch)
 
@@ -501,12 +502,13 @@ def _build_environment_and_regions(
             )
         raise RuntimeError("ACD decomposition did not produce usable polygons.")
 
+    adjacency_regions = create_regions_from_vertices_list(region_vertices)
     regions = create_buffered_regions_from_vertices_list(
         region_vertices,
         workspace_vertices,
         buffer_size=buffer_size,
     )
-    return environment, regions
+    return environment, regions, adjacency_regions
 
 
 class MazeBenchmarkRunner:
@@ -745,7 +747,7 @@ class MazeBenchmarkRunner:
                     goal_pos=goal_state[:2],
                 )
 
-            environment, regions = _build_environment_and_regions(
+            environment, regions, adjacency_regions = _build_environment_and_regions(
                 self.acd,
                 workspace_vertices,
                 obstacle_vertices,
@@ -767,7 +769,12 @@ class MazeBenchmarkRunner:
                 f"{len(environment.obstacles)} obstacles and {len(regions)} regions"
             )
 
-            graph = build_region_graph(regions, start_state[:2], goal_state[:2])
+            graph = build_region_graph(
+                regions,
+                start_state[:2],
+                goal_state[:2],
+                adjacency_regions=adjacency_regions,
+            )
 
             dyn_cfg = self.resolved.runtime_config.get("dynamics", {})
             dynamics = UnicycleModel(
