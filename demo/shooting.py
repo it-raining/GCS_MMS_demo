@@ -16,7 +16,8 @@ import casadi as ca
 
 from dynamics import (DynamicsModel, UnicycleModel, ControlParameterization,
                       RK4Integrator, create_casadi_integrator, 
-                      create_casadi_trajectory_sampler)
+                      create_casadi_trajectory_sampler,
+                      create_casadi_ctcs_integrator)
 from convex_regions import ConvexRegion
 
 
@@ -38,6 +39,14 @@ class ShootingBlockConfig:
     n_mesh_points: int = 10
     n_control_segments: int = 2
     safety_margin: float = 0.02
+    safety_mode: str = "both"
+    ctcs_tolerance: float = 1.0e-6
+    ctcs_penalty: str = "squared_hinge"
+    ctcs_integral_mode: str = "normalized"
+    ctcs_eta_big_m: float = 100.0
+    dense_check_points: int = 1000
+    dense_check_tolerance: float = 1.0e-4
+    fail_on_dense_violation: bool = True
     delta_min: float = 0.1
     delta_max: float = 10.0
 
@@ -70,6 +79,7 @@ class ShootingBlock:
     control_param: ControlParameterization = field(init=False)
     integrator: RK4Integrator = field(init=False)
     F_casadi: Callable = field(init=False)
+    F_ctcs_casadi: Callable = field(init=False)
     mesh_sampler: Callable = field(init=False)
     
     def __post_init__(self):
@@ -93,6 +103,16 @@ class ShootingBlock:
             dynamics=self.dynamics,
             control_param=self.control_param,
             n_steps=self.config.n_integration_steps
+        )
+
+        self.F_ctcs_casadi = create_casadi_ctcs_integrator(
+            dynamics=self.dynamics,
+            control_param=self.control_param,
+            region=self.region,
+            n_steps=self.config.n_integration_steps,
+            safety_margin=self.config.safety_margin,
+            penalty=self.config.ctcs_penalty,
+            integral_mode=self.config.ctcs_integral_mode
         )
         
         # CasADi mesh sampler
@@ -175,6 +195,100 @@ class ShootingBlock:
         is_safe = np.all(violations <= 0)
         
         return is_safe, violations
+
+    def continuous_safety_certificate_casadi(self, s_minus, w, delta):
+        """Return symbolic eta_end for the CTCS RK4 violation integral."""
+        _, eta_end = self.F_ctcs_casadi(s_minus, w, delta)
+        return eta_end
+
+    def compute_ctcs_violation_integral(self, s_minus: np.ndarray, w: np.ndarray,
+                                        delta: float) -> Dict:
+        """NumPy RK4 equivalent of the CTCS accumulated violation diagnostic."""
+        x = np.asarray(s_minus, dtype=np.float64).copy()
+        w = np.asarray(w, dtype=np.float64)
+        delta = float(delta)
+        dt = 1.0 / self.config.n_integration_steps
+        eta = 0.0
+        stage_violations = []
+
+        def lambda_and_max_violation(x_stage: np.ndarray) -> Tuple[float, float]:
+            pos = self.dynamics.project_to_position(x_stage)
+            residual = self.region.A @ pos - self.region.b
+            hinge = np.maximum(0.0, residual)
+            return float(np.sum(hinge * hinge)), float(np.max(residual))
+
+        for i in range(self.config.n_integration_steps):
+            tau = i * dt
+            tau_mid = tau + 0.5 * dt
+            tau_end = tau + dt
+
+            u0 = self.control_param.evaluate(tau, w)
+            um = self.control_param.evaluate(tau_mid, w)
+            u1 = self.control_param.evaluate(tau_end, w)
+
+            lam1, max1 = lambda_and_max_violation(x)
+            k1_x = delta * self.dynamics.f(x, u0)
+            eta_scale = delta if self.config.ctcs_integral_mode == "physical_time" else 1.0
+            k1_eta = eta_scale * lam1
+
+            x2 = x + 0.5 * dt * k1_x
+            lam2, max2 = lambda_and_max_violation(x2)
+            k2_x = delta * self.dynamics.f(x2, um)
+            k2_eta = eta_scale * lam2
+
+            x3 = x + 0.5 * dt * k2_x
+            lam3, max3 = lambda_and_max_violation(x3)
+            k3_x = delta * self.dynamics.f(x3, um)
+            k3_eta = eta_scale * lam3
+
+            x4 = x + dt * k3_x
+            lam4, max4 = lambda_and_max_violation(x4)
+            k4_x = delta * self.dynamics.f(x4, u1)
+            k4_eta = eta_scale * lam4
+
+            x = x + (dt / 6) * (k1_x + 2*k2_x + 2*k3_x + k4_x)
+            eta += (dt / 6) * (k1_eta + 2*k2_eta + 2*k3_eta + k4_eta)
+            stage_violations.extend([max1, max2, max3, max4])
+
+        return {
+            'eta_end': float(eta),
+            'max_stage_violation': float(max(stage_violations)) if stage_violations else 0.0,
+            'stage_violations': np.asarray(stage_violations, dtype=np.float64),
+        }
+
+    def check_continuous_safety(self, s_minus: np.ndarray, w: np.ndarray,
+                                delta: float) -> Dict:
+        """Check eta_end against the configured CTCS tolerance."""
+        diagnostic = self.compute_ctcs_violation_integral(s_minus, w, delta)
+        diagnostic['is_safe'] = diagnostic['eta_end'] <= self.config.ctcs_tolerance
+        return diagnostic
+
+    def dense_check_safety(self, s_minus: np.ndarray, w: np.ndarray,
+                           delta: float, n_points: Optional[int] = None) -> Dict:
+        """Dense signed region violation check for post-solve verification."""
+        n_points = int(n_points or self.config.dense_check_points)
+        n_points = max(n_points, 2)
+        dense_integrator = RK4Integrator(
+            dynamics=self.dynamics,
+            control_param=self.control_param,
+            n_steps=n_points - 1
+        )
+        traj, tau_values = dense_integrator.integrate_with_trajectory(s_minus, w, delta)
+        max_violation = -np.inf
+        violations = []
+
+        for state in traj:
+            pos = self.dynamics.project_to_position(state)
+            residual = self.region.A @ pos - self.region.b
+            violations.append(residual)
+            max_violation = max(max_violation, float(np.max(residual)))
+
+        return {
+            'max_violation': float(max_violation),
+            'is_safe': bool(max_violation <= self.config.dense_check_tolerance),
+            'tau': tau_values,
+            'violations': np.asarray(violations, dtype=np.float64),
+        }
     
     def compute_local_cost(self, s_minus: np.ndarray, w: np.ndarray,
                            delta: float, cost_weights: Dict[str, float]) -> float:
@@ -275,6 +389,38 @@ class ShootingBlockManager:
                 config, ('shooting', 'safety_margin'),
                 config.get('safety_margin', 0.02)
             ),
+            'safety_mode': _get_config_value(
+                config, ('shooting', 'safety_mode'),
+                config.get('safety_mode', 'both')
+            ),
+            'ctcs_tolerance': _get_config_value(
+                config, ('shooting', 'ctcs_tolerance'),
+                config.get('ctcs_tolerance', 1.0e-6)
+            ),
+            'ctcs_penalty': _get_config_value(
+                config, ('shooting', 'ctcs_penalty'),
+                config.get('ctcs_penalty', 'squared_hinge')
+            ),
+            'ctcs_integral_mode': _get_config_value(
+                config, ('shooting', 'ctcs_integral_mode'),
+                config.get('ctcs_integral_mode', 'normalized')
+            ),
+            'ctcs_eta_big_m': _get_config_value(
+                config, ('shooting', 'ctcs_eta_big_m'),
+                config.get('ctcs_eta_big_m', 100.0)
+            ),
+            'dense_check_points': _get_config_value(
+                config, ('shooting', 'dense_check_points'),
+                config.get('dense_check_points', 1000)
+            ),
+            'dense_check_tolerance': _get_config_value(
+                config, ('shooting', 'dense_check_tolerance'),
+                config.get('dense_check_tolerance', 1.0e-4)
+            ),
+            'fail_on_dense_violation': _get_config_value(
+                config, ('shooting', 'fail_on_dense_violation'),
+                config.get('fail_on_dense_violation', True)
+            ),
             'delta_min': _get_config_value(
                 config, ('dynamics', 'delta_min'),
                 config.get('delta_min', 0.1)
@@ -300,6 +446,14 @@ class ShootingBlockManager:
                 n_mesh_points=self.config['n_mesh_points'],
                 n_control_segments=self.config['n_control_segments'],
                 safety_margin=self.config['safety_margin'],
+                safety_mode=self.config['safety_mode'],
+                ctcs_tolerance=self.config['ctcs_tolerance'],
+                ctcs_penalty=self.config['ctcs_penalty'],
+                ctcs_integral_mode=self.config['ctcs_integral_mode'],
+                ctcs_eta_big_m=self.config['ctcs_eta_big_m'],
+                dense_check_points=self.config['dense_check_points'],
+                dense_check_tolerance=self.config['dense_check_tolerance'],
+                fail_on_dense_violation=self.config['fail_on_dense_violation'],
                 delta_min=self.config['delta_min'],
                 delta_max=self.config['delta_max']
             )

@@ -68,6 +68,14 @@ class MazeBenchmarkCaseResult:
     max_connection_gap: float
     max_integrality_gap: float
     solver_status: str
+    pipeline_mode: str = "integrated"
+    n_paths_screened: int = 0
+    n_paths_polished: int = 0
+    early_stopped: bool = False
+    repair_attempted: bool = False
+    max_ctcs_integral: float = 0.0
+    max_dense_region_violation: float = 0.0
+    failure_reasons: List[str] | None = None
     geometry_debug_path: str | None = None
     geometry_classification_debug_path: str | None = None
     free_space_coordinates_path: str | None = None
@@ -667,13 +675,12 @@ class MazeBenchmarkRunner:
         elif animation_path is not None:
             animation_path = None
 
-        if verbose:
-            if summary_path is not None:
-                print(f"[maze seed={seed_value}] Saved result summary: {summary_path}")
-            if figure_path is not None:
-                print(f"[maze seed={seed_value}] Saved result figure: {figure_path}")
-            if animation_path is not None:
-                print(f"[maze seed={seed_value}] Saved result animation: {animation_path}")
+        if summary_path is not None:
+            print(f"[maze seed={seed_value}] Saved result summary: {summary_path}")
+        if figure_path is not None:
+            print(f"[maze seed={seed_value}] Saved result figure: {figure_path}")
+        if animation_path is not None:
+            print(f"[maze seed={seed_value}] Saved result animation: {animation_path}")
 
         return summary_path, figure_path, animation_path
 
@@ -795,6 +802,9 @@ class MazeBenchmarkRunner:
                 constraint_violation=0.0,
                 max_connection_gap=0.0,
                 max_integrality_gap=0.0,
+                max_ctcs_integral=0.0,
+                max_dense_region_violation=0.0,
+                failure_reasons=[f"Maze benchmark setup failed: {exc}"],
                 solver_status=f"Maze benchmark setup failed: {exc}",
                 geometry_debug_path=str(geometry_debug_path) if geometry_debug_path is not None else None,
                 geometry_classification_debug_path=None,
@@ -865,6 +875,14 @@ class MazeBenchmarkRunner:
             constraint_violation=result.constraint_violation,
             max_connection_gap=result.max_connection_gap,
             max_integrality_gap=result.max_integrality_gap,
+            pipeline_mode=result.pipeline_mode,
+            n_paths_screened=result.n_paths_screened,
+            n_paths_polished=result.n_paths_polished,
+            early_stopped=result.early_stopped,
+            repair_attempted=result.repair_attempted,
+            max_ctcs_integral=result.max_continuous_violation_integral,
+            max_dense_region_violation=result.max_dense_region_violation,
+            failure_reasons=result.failure_reasons,
             solver_status=result.solver_status,
             geometry_debug_path=str(geometry_debug_path) if geometry_debug_path is not None else None,
             geometry_classification_debug_path=None,

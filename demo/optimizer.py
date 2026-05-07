@@ -17,13 +17,14 @@ Solvers: CasADi + IPOPT
 
 import numpy as np
 from typing import List, Dict, Tuple, Optional, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import casadi as ca
 import time
 
 from graph_builder import RegionGraph, SOURCE, TARGET
 from dynamics import (DynamicsModel, ControlParameterization,
-                      create_casadi_integrator, create_casadi_trajectory_sampler)
+                      create_casadi_integrator, create_casadi_trajectory_sampler,
+                      create_casadi_ctcs_integrator, RK4Integrator)
 from shooting import create_casadi_local_cost
 
 
@@ -41,10 +42,20 @@ class OptimizationConfig:
     n_mesh_points: int = 5
     n_control_segments: int = 2
     safety_margin: float = 0.02
+    safety_mode: str = "both"
+    ctcs_tolerance: float = 1.0e-6
+    ctcs_penalty: str = "squared_hinge"
+    ctcs_integral_mode: str = "normalized"
+    ctcs_use_rk4_stages: bool = True
+    ctcs_eta_big_m: float = 100.0
+    dense_check_points: int = 1000
+    dense_check_tolerance: float = 1.0e-4
+    fail_on_dense_violation: bool = True
     boundary_tolerance: float = 1e-8
     
     # Time bounds
     delta_min: float = 0.1
+    active_delta_min: float = 0.05
     delta_max: float = 10.0
     
     # Control bounds (unicycle)
@@ -63,7 +74,27 @@ class OptimizationConfig:
     max_iter: int = 3000
     tol: float = 1e-6
     print_level: int = 0
-    max_polish_path_candidates: int = 3
+    max_polish_path_candidates: int = 20
+    final_connection_tolerance: float = 1e-6
+    final_defect_tolerance: float = 1e-6
+    final_integrality_tolerance: float = 1e-6
+
+    # Pipeline controls
+    pipeline_mode: str = "integrated"
+    path_screen_top_k: int = 5
+    path_screen_max_paths: int = 1500
+    early_stop_on_feasible: bool = True
+    acceptable_dense_tolerance_for_repair: float = 5e-3
+    screening_ipopt_tol: float = 1e-4
+    screening_max_iter: int = 500
+    final_ipopt_tol: float = 1e-6
+    final_max_iter: int = 3000
+    repair_enabled: bool = True
+    repair_max_rounds: int = 2
+    local_shrink_margin: float = 0.003
+    adaptive_refine_enabled: bool = True
+    screening_safety_mode: Optional[str] = None
+    local_region_safety_margins: Dict[int, float] = field(default_factory=dict)
     
 @dataclass
 class OptimizationResult:
@@ -92,9 +123,25 @@ class OptimizationResult:
     solver_status: str = ""
     defect_norm: float = 0.0
     constraint_violation: float = 0.0
+    continuous_violation_integrals: Dict[int, float] = field(default_factory=dict)
+    max_continuous_violation_integral: float = 0.0
+    max_dense_region_violation: float = 0.0
+    safety_mode: str = "both"
     max_connection_gap: float = 0.0
     max_control_jump: float = 0.0
     max_integrality_gap: float = 0.0
+    safety_diagnostics: Dict[int, Dict] = field(default_factory=dict)
+    transition_diagnostics: List[Dict] = field(default_factory=list)
+    failure_reasons: List[str] = field(default_factory=list)
+    pipeline_mode: str = "integrated"
+    candidate_paths_ranked: List[Dict] = field(default_factory=list)
+    n_paths_screened: int = 0
+    n_paths_polished: int = 0
+    early_stopped: bool = False
+    repair_attempted: bool = False
+    repaired_regions: List[int] = field(default_factory=list)
+    per_candidate_diagnostics: List[Dict] = field(default_factory=list)
+    stage_timings: Dict[str, float] = field(default_factory=dict)
 
 
 def _compute_connection_gap(path_regions: List[int],
@@ -166,6 +213,52 @@ def _interior_mesh_indices(n_mesh: int) -> range:
     return range(1, n_mesh - 1)
 
 
+def _uses_mesh_safety(safety_mode: str) -> bool:
+    return safety_mode in ("mesh", "both")
+
+
+def _uses_ctcs_safety(safety_mode: str) -> bool:
+    return safety_mode in ("ctcs", "both")
+
+
+def _validate_safety_mode(safety_mode: str) -> str:
+    if safety_mode not in ("mesh", "ctcs", "both"):
+        raise ValueError(f"Unsupported shooting.safety_mode: {safety_mode}")
+    return safety_mode
+
+
+def _validate_pipeline_mode(pipeline_mode: str) -> str:
+    if pipeline_mode not in ("integrated", "two_stage"):
+        raise ValueError(f"Unsupported optimizer.pipeline_mode: {pipeline_mode}")
+    return pipeline_mode
+
+
+def _region_safety_margin(config: OptimizationConfig, region_idx: int) -> float:
+    return float(
+        config.local_region_safety_margins.get(region_idx, config.safety_margin)
+    )
+
+
+def _warm_start_from_result(
+    result: OptimizationResult,
+) -> Dict[int, Dict[str, np.ndarray | float]]:
+    warm_start = {}
+    for region_idx in result.path_regions:
+        if (
+            region_idx in result.entry_states and
+            region_idx in result.exit_states and
+            region_idx in result.control_params and
+            region_idx in result.time_durations
+        ):
+            warm_start[region_idx] = {
+                's_minus': result.entry_states[region_idx],
+                's_plus': result.exit_states[region_idx],
+                'w': result.control_params[region_idx],
+                'delta': result.time_durations[region_idx],
+            }
+    return warm_start
+
+
 def _get_graph_edge_anchor(graph: RegionGraph,
                            edge: Tuple[str, str],
                            start_state: np.ndarray,
@@ -185,6 +278,134 @@ def _get_graph_edge_anchor(graph: RegionGraph,
     u_centroid = graph.get_region_by_id(u).get_centroid()
     v_centroid = graph.get_region_by_id(v).get_centroid()
     return 0.5 * (u_centroid + v_centroid)
+
+
+def _region_dense_diagnostic(graph: RegionGraph,
+                             dynamics: DynamicsModel,
+                             control_param: ControlParameterization,
+                             config: OptimizationConfig,
+                             region_idx: int,
+                             s_minus: np.ndarray,
+                             w: np.ndarray,
+                             delta: float) -> Dict:
+    """Detailed dense post-check diagnostic for one local region segment."""
+    region = graph.regions[region_idx]
+    n_steps = max(int(config.dense_check_points) - 1, 1)
+    dense_integrator = RK4Integrator(dynamics, control_param, n_steps=n_steps)
+    traj, tau_values = dense_integrator.integrate_with_trajectory(s_minus, w, delta)
+
+    max_violation = -np.inf
+    worst_point = None
+    worst_tau = 0.0
+    worst_halfspace = -1
+    n_violating_samples = 0
+
+    for state, tau in zip(traj, tau_values):
+        pos = dynamics.project_to_position(state)
+        residual = region.A @ pos - region.b
+        local_idx = int(np.argmax(residual))
+        local_max = float(residual[local_idx])
+        if local_max > config.dense_check_tolerance:
+            n_violating_samples += 1
+        if local_max > max_violation:
+            max_violation = local_max
+            worst_point = np.asarray(pos, dtype=np.float64)
+            worst_tau = float(tau)
+            worst_halfspace = local_idx
+
+    return {
+        'region': int(region_idx),
+        'delta': float(delta),
+        'max_violation': float(max_violation),
+        'n_violating_samples': int(n_violating_samples),
+        'worst_point': worst_point.tolist() if worst_point is not None else None,
+        'worst_tau': float(worst_tau),
+        'worst_halfspace': int(worst_halfspace),
+    }
+
+
+def _transition_diagnostics(graph: RegionGraph,
+                            path_regions: List[int],
+                            entry_states: Dict[int, np.ndarray],
+                            exit_states: Dict[int, np.ndarray]) -> List[Dict]:
+    """Connection and intersection diagnostics for a fixed region path."""
+    diagnostics = []
+    for left_idx, right_idx in zip(path_regions[:-1], path_regions[1:]):
+        left_node = f"R{left_idx}"
+        right_node = f"R{right_idx}"
+        z_left = exit_states[left_idx][:2]
+        z_right = entry_states[right_idx][:2]
+        z_mid = 0.5 * (z_left + z_right)
+        gap = float(np.linalg.norm(z_left - z_right))
+        region_left = graph.regions[left_idx]
+        region_right = graph.regions[right_idx]
+        left_violation = float(np.max(region_left.A @ z_mid - region_left.b))
+        right_violation = float(np.max(region_right.A @ z_mid - region_right.b))
+        diagnostics.append({
+            'edge': [left_node, right_node],
+            'connection_gap': gap,
+            'intersection_violation': max(left_violation, right_violation),
+            'z_mid': z_mid.tolist(),
+        })
+    return diagnostics
+
+
+def _apply_final_success_criteria(result: OptimizationResult,
+                                  config: OptimizationConfig,
+                                  require_integral_final: bool = False,
+                                  require_integrality: bool = False,
+                                  solver_ok: bool = True) -> None:
+    """Centralized final feasibility gate for returned trajectories."""
+    reasons = []
+    if not solver_ok:
+        reasons.append("solver did not report acceptable success")
+    if result.max_connection_gap > config.final_connection_tolerance:
+        reasons.append(
+            f"connection gap {result.max_connection_gap:.2e} > "
+            f"{config.final_connection_tolerance:.2e}"
+        )
+    if result.defect_norm > config.final_defect_tolerance:
+        reasons.append(
+            f"defect norm {result.defect_norm:.2e} > "
+            f"{config.final_defect_tolerance:.2e}"
+        )
+    if require_integrality and result.max_integrality_gap > config.final_integrality_tolerance:
+        reasons.append(
+            f"integrality gap {result.max_integrality_gap:.2e} > "
+            f"{config.final_integrality_tolerance:.2e}"
+        )
+    if result.max_dense_region_violation > config.dense_check_tolerance:
+        reasons.append(
+            f"dense violation {result.max_dense_region_violation:.2e} > "
+            f"{config.dense_check_tolerance:.2e}"
+        )
+    if require_integral_final and result.max_continuous_violation_integral > config.ctcs_tolerance:
+        reasons.append(
+            f"CTCS integral {result.max_continuous_violation_integral:.2e} > "
+            f"{config.ctcs_tolerance:.2e}"
+        )
+    active_delta_min = max(config.delta_min, config.active_delta_min)
+    collapsed = [
+        (idx, delta)
+        for idx, delta in result.time_durations.items()
+        if delta < active_delta_min - 1e-8
+    ]
+    if collapsed:
+        worst_idx, worst_delta = min(collapsed, key=lambda item: item[1])
+        reasons.append(
+            f"active duration collapse R{worst_idx}={worst_delta:.2e} < "
+            f"{active_delta_min:.2e}"
+        )
+
+    result.failure_reasons = reasons
+    if reasons:
+        result.success = False
+        detail = "; ".join(reasons)
+        result.solver_status = (
+            f"{result.solver_status} | FINAL CHECK FAILED: {detail}"
+            if result.solver_status else
+            f"FINAL CHECK FAILED: {detail}"
+        )
 
 
 class PathNLPSolver:
@@ -210,6 +431,8 @@ class PathNLPSolver:
         self.graph = graph
         self.dynamics = dynamics
         self.config = config
+        self.config.safety_mode = _validate_safety_mode(self.config.safety_mode)
+        self.config.pipeline_mode = _validate_pipeline_mode(self.config.pipeline_mode)
         
         # Control parameterization
         self.control_param = ControlParameterization(
@@ -231,6 +454,18 @@ class PathNLPSolver:
         self.local_cost_fn = create_casadi_local_cost(
             dynamics, self.control_param, config.n_integration_steps
         )
+        self.ctcs_integrators = {
+            region.index: create_casadi_ctcs_integrator(
+                dynamics,
+                self.control_param,
+                region,
+                config.n_integration_steps,
+                _region_safety_margin(config, region.index),
+                config.ctcs_penalty,
+                config.ctcs_integral_mode
+            )
+            for region in graph.regions
+        }
 
         if graph.regions:
             all_vertices = np.vstack([region.vertices for region in graph.regions])
@@ -254,7 +489,10 @@ class PathNLPSolver:
     
     def solve_path(self, path: List[str], start_state: np.ndarray,
                    goal_state: np.ndarray,
-                   warm_start: Optional[Dict[int, Dict[str, np.ndarray | float]]] = None
+                   warm_start: Optional[Dict[int, Dict[str, np.ndarray | float]]] = None,
+                   ipopt_tol: Optional[float] = None,
+                   max_iter: Optional[int] = None,
+                   safety_mode: Optional[str] = None
                    ) -> OptimizationResult:
         """
         Solve NLP for a fixed path.
@@ -267,6 +505,16 @@ class PathNLPSolver:
         Returns:
             OptimizationResult
         """
+        original_tol = self.config.tol
+        original_max_iter = self.config.max_iter
+        original_safety_mode = self.config.safety_mode
+        if ipopt_tol is not None:
+            self.config.tol = float(ipopt_tol)
+        if max_iter is not None:
+            self.config.max_iter = int(max_iter)
+        if safety_mode is not None:
+            self.config.safety_mode = _validate_safety_mode(safety_mode)
+
         # Extract region sequence (excluding source/target)
         path_regions = []
         for node_id in path:
@@ -277,6 +525,9 @@ class PathNLPSolver:
         n_regions = len(path_regions)
         
         if n_regions == 0:
+            self.config.tol = original_tol
+            self.config.max_iter = original_max_iter
+            self.config.safety_mode = original_safety_mode
             return OptimizationResult(
                 success=False, path=path, path_regions=[],
                 total_cost=np.inf, solve_time=0.0, n_paths_evaluated=1,
@@ -301,6 +552,10 @@ class PathNLPSolver:
                 total_cost=np.inf, solve_time=time.time() - start_time,
                 n_paths_evaluated=1, solver_status=f"Error: {str(e)}"
             )
+        finally:
+            self.config.tol = original_tol
+            self.config.max_iter = original_max_iter
+            self.config.safety_mode = original_safety_mode
     
     def _build_and_solve_nlp(self, path_regions: List[int],
                              start_state: np.ndarray,
@@ -360,8 +615,9 @@ class PathNLPSolver:
             init_theta = default_heading
             if np.linalg.norm(direction) > 1e-9:
                 init_theta = float(np.arctan2(direction[1], direction[0]))
+            delta_min = max(self.config.delta_min, self.config.active_delta_min)
             delta_init = max(
-                self.config.delta_min,
+                delta_min,
                 min(
                     self.config.delta_max,
                     float(np.linalg.norm(direction)) / max(abs(self.config.v_max), 1e-6)
@@ -416,10 +672,10 @@ class PathNLPSolver:
             delta = ca.MX.sym(f'delta_{i}', 1)
             delta_list.append(delta)
             
-            lbx.append(self.config.delta_min)
+            lbx.append(delta_min)
             ubx.append(self.config.delta_max)
             if warm is not None and 'delta' in warm:
-                x0.append(max(self.config.delta_min, min(self.config.delta_max, float(warm['delta']))))
+                x0.append(max(delta_min, min(self.config.delta_max, float(warm['delta']))))
             else:
                 x0.append(delta_init)
         
@@ -442,14 +698,21 @@ class PathNLPSolver:
         # Layer 4: Nonlinear multiple-shooting dynamics
         # -----------------------------------------------------------------
         
+        ctcs_outputs = {}
         for i, region_idx in enumerate(path_regions):
             s_minus = s_minus_list[i]
             s_plus = s_plus_list[i]
             w = w_list[i]
             delta = delta_list[i]
             
-            # Defect constraint: s_plus - F(s_minus, w, delta) = 0
-            F_result = self.F_endpoint(s_minus, w, delta)
+            # Defect constraint: s_plus - F(s_minus, w, delta) = 0.
+            # In CTCS modes, use the augmented RK4 endpoint so the defect and
+            # accumulated violation integral follow the same stages.
+            if _uses_ctcs_safety(self.config.safety_mode):
+                F_result, eta_end = self.ctcs_integrators[region_idx](s_minus, w, delta)
+                ctcs_outputs[i] = (F_result, eta_end)
+            else:
+                F_result = self.F_endpoint(s_minus, w, delta)
             defect = s_plus - F_result
             
             g.append(defect)
@@ -481,15 +744,22 @@ class PathNLPSolver:
                 lbg.extend([-np.inf] * len(region.b))
                 ubg.extend([0.0] * len(region.b))
 
-            mesh_positions = self.mesh_sampler(s_minus, w, delta)
-            margin = self.config.safety_margin
-            
-            for k in _interior_mesh_indices(n_mesh):
-                pos = mesh_positions[k, :]
-                violation = ca.mtimes(A_dm, pos.T) - b_dm + margin
-                g.append(violation)
-                lbg.extend([-np.inf] * len(region.b))
-                ubg.extend([0.0] * len(region.b))
+            if _uses_mesh_safety(self.config.safety_mode):
+                mesh_positions = self.mesh_sampler(s_minus, w, delta)
+                margin = _region_safety_margin(self.config, region_idx)
+                
+                for k in _interior_mesh_indices(n_mesh):
+                    pos = mesh_positions[k, :]
+                    violation = ca.mtimes(A_dm, pos.T) - b_dm + margin
+                    g.append(violation)
+                    lbg.extend([-np.inf] * len(region.b))
+                    ubg.extend([0.0] * len(region.b))
+
+            if _uses_ctcs_safety(self.config.safety_mode):
+                _, eta_end = ctcs_outputs[i]
+                g.append(eta_end)
+                lbg.append(-np.inf)
+                ubg.append(self.config.ctcs_tolerance)
         
         # -----------------------------------------------------------------
         # Layer 3: On/off coupling (interface matching)
@@ -612,9 +882,95 @@ class PathNLPSolver:
             lbg,
             ubg
         )
+        self._populate_safety_diagnostics(result)
+        _apply_final_success_criteria(
+            result,
+            self.config,
+            require_integral_final=_uses_ctcs_safety(self.config.safety_mode),
+            solver_ok=success,
+        )
         
         return result
     
+    def _compute_ctcs_eta_numpy(self, region_idx: int, s_minus: np.ndarray,
+                                w: np.ndarray, delta: float) -> float:
+        """Evaluate the CTCS RK4 accumulated violation integral numerically."""
+        _, eta_end = self.ctcs_integrators[region_idx](s_minus, w, delta)
+        return float(np.asarray(eta_end).reshape(-1)[0])
+
+    def _compute_dense_region_violation(self, region_idx: int, s_minus: np.ndarray,
+                                        w: np.ndarray, delta: float) -> float:
+        """Sample a local trajectory densely and return max signed H-rep violation."""
+        diagnostic = _region_dense_diagnostic(
+            self.graph,
+            self.dynamics,
+            self.control_param,
+            self.config,
+            region_idx,
+            s_minus,
+            w,
+            delta,
+        )
+        return float(diagnostic['max_violation'])
+
+    def _populate_safety_diagnostics(self, result: OptimizationResult) -> None:
+        """Attach CTCS and dense post-check diagnostics to a parsed result."""
+        result.safety_mode = self.config.safety_mode
+        ctcs_values = {}
+        dense_values = []
+        dense_diagnostics = {}
+
+        for region_idx in result.path_regions:
+            if region_idx not in result.entry_states:
+                continue
+            s_minus = result.entry_states[region_idx]
+            w = result.control_params[region_idx]
+            delta = result.time_durations[region_idx]
+            eta = self._compute_ctcs_eta_numpy(region_idx, s_minus, w, delta)
+            ctcs_values[region_idx] = eta
+            dense_diag = _region_dense_diagnostic(
+                self.graph,
+                self.dynamics,
+                self.control_param,
+                self.config,
+                region_idx,
+                s_minus,
+                w,
+                delta,
+            )
+            dense_diag['ctcs_integral'] = eta
+            dense_diagnostics[region_idx] = dense_diag
+            dense_values.append(float(dense_diag['max_violation']))
+
+        result.continuous_violation_integrals = ctcs_values
+        result.safety_diagnostics = dense_diagnostics
+        result.max_continuous_violation_integral = (
+            float(max(ctcs_values.values())) if ctcs_values else 0.0
+        )
+        result.max_dense_region_violation = (
+            float(max(dense_values)) if dense_values else 0.0
+        )
+
+        if result.max_dense_region_violation > self.config.dense_check_tolerance:
+            warning = (
+                "dense post-check violation "
+                f"{result.max_dense_region_violation:.2e} > "
+                f"{self.config.dense_check_tolerance:.2e}"
+            )
+            result.solver_status = (
+                f"{result.solver_status} | WARNING: {warning}"
+                if result.solver_status else
+                f"WARNING: {warning}"
+            )
+            if self.config.fail_on_dense_violation:
+                result.success = False
+        result.transition_diagnostics = _transition_diagnostics(
+            self.graph,
+            result.path_regions,
+            result.entry_states,
+            result.exit_states,
+        )
+
     def _parse_solution(self, x_opt: np.ndarray, path_regions: List[int],
                         n_x: int, n_w: int,
                         start_state: np.ndarray,
@@ -652,8 +1008,6 @@ class PathNLPSolver:
             result.time_durations[region_idx] = delta
         
         # Compute trajectories for visualization
-        from dynamics import RK4Integrator
-        
         integrator = RK4Integrator(
             self.dynamics, self.control_param,
             self.config.n_integration_steps
@@ -737,6 +1091,8 @@ class IntegratedMIOCPSolver:
         self.graph = graph
         self.dynamics = dynamics
         self.config = config
+        self.config.safety_mode = _validate_safety_mode(self.config.safety_mode)
+        self.config.pipeline_mode = _validate_pipeline_mode(self.config.pipeline_mode)
         self.path_solver = PathNLPSolver(graph, dynamics, config)
         
         self.control_param = ControlParameterization(
@@ -755,6 +1111,18 @@ class IntegratedMIOCPSolver:
         self.local_cost_fn = create_casadi_local_cost(
             dynamics, self.control_param, config.n_integration_steps
         )
+        self.ctcs_integrators = {
+            region.index: create_casadi_ctcs_integrator(
+                dynamics,
+                self.control_param,
+                region,
+                config.n_integration_steps,
+                _region_safety_margin(config, region.index),
+                config.ctcs_penalty,
+                config.ctcs_integral_mode
+            )
+            for region in graph.regions
+        }
         
         all_vertices = np.vstack([region.vertices for region in graph.regions])
         max_abs_pos = float(np.max(np.abs(all_vertices))) if all_vertices.size else 1.0
@@ -836,11 +1204,18 @@ class IntegratedMIOCPSolver:
 
     def _iter_candidate_paths(self, start_state: np.ndarray,
                               goal_state: np.ndarray,
-                              max_candidates: int) -> List[List[str]]:
-        """Generate a small set of centroid-shortest source-target paths."""
+                              max_candidates: int,
+                              edge_values: Optional[Dict[Tuple[str, str], float]] = None
+                              ) -> List[List[str]]:
+        """Generate source-target candidate paths, weighted by relaxed flow if available."""
         import networkx as nx
 
         def edge_weight(u: str, v: str, _attrs: Dict) -> float:
+            flow_term = 0.0
+            if edge_values is not None:
+                flow = max(float(edge_values.get((u, v), 0.0)), 1e-9)
+                flow_term = -np.log(flow)
+
             if u == SOURCE:
                 p1 = start_state[:2]
             else:
@@ -851,9 +1226,10 @@ class IntegratedMIOCPSolver:
             else:
                 p2 = self.graph.get_region_by_id(v).get_centroid()
 
-            return float(np.linalg.norm(p2 - p1))
+            return float(flow_term + 1e-3 * np.linalg.norm(p2 - p1))
 
         candidates = []
+        seen = set()
         try:
             for path in nx.shortest_simple_paths(
                 self.graph.graph,
@@ -861,6 +1237,10 @@ class IntegratedMIOCPSolver:
                 TARGET,
                 weight=edge_weight
             ):
+                path_key = tuple(path)
+                if path_key in seen:
+                    continue
+                seen.add(path_key)
                 candidates.append(path)
                 if len(candidates) >= max_candidates:
                     break
@@ -869,18 +1249,123 @@ class IntegratedMIOCPSolver:
 
         return candidates
 
+    def _score_candidate_path(self,
+                              path: List[str],
+                              start_state: np.ndarray,
+                              goal_state: np.ndarray) -> Dict:
+        """Cheap geometric score for screening fixed discrete paths."""
+        edges = [(path[i], path[i + 1]) for i in range(len(path) - 1)]
+        anchors = [
+            self._get_edge_anchor(edge, start_state, goal_state)
+            for edge in edges
+        ]
+        points = [np.asarray(start_state[:2], dtype=np.float64)] + anchors + [
+            np.asarray(goal_state[:2], dtype=np.float64)
+        ]
+
+        distance = 0.0
+        for p0, p1 in zip(points[:-1], points[1:]):
+            distance += float(np.linalg.norm(p1 - p0))
+
+        turn_penalty = 0.0
+        for p0, p1, p2 in zip(points[:-2], points[1:-1], points[2:]):
+            v0 = p1 - p0
+            v1 = p2 - p1
+            n0 = np.linalg.norm(v0)
+            n1 = np.linalg.norm(v1)
+            if n0 <= 1e-9 or n1 <= 1e-9:
+                continue
+            cos_angle = float(np.clip(np.dot(v0, v1) / (n0 * n1), -1.0, 1.0))
+            turn_penalty += float(np.arccos(cos_angle) ** 2)
+
+        narrow_penalty = 0.0
+        for edge in edges:
+            intersection = self.graph.intersections.get(edge)
+            if intersection is None:
+                continue
+            poly = intersection.get_shapely_polygon()
+            width_proxy = max(float(poly.area), float(poly.length) * 1e-3, 1e-12)
+            narrow_penalty += 1.0 / np.sqrt(width_proxy)
+
+        sliver_penalty = 0.0
+        for node_id in path:
+            if node_id in (SOURCE, TARGET):
+                continue
+            region = self.graph.get_region_by_id(node_id)
+            poly = region.get_shapely_polygon()
+            area = max(float(poly.area), 1e-12)
+            perimeter = max(float(poly.length), 1e-12)
+            compactness = 4.0 * np.pi * area / (perimeter ** 2)
+            sliver_penalty += max(0.0, 0.25 - compactness) / area
+
+        path_length = max(len(path) - 2, 0)
+        score = (
+            distance +
+            0.05 * path_length +
+            0.02 * turn_penalty +
+            1e-4 * narrow_penalty +
+            1e-4 * sliver_penalty
+        )
+        return {
+            'path': path,
+            'path_regions': [
+                int(node_id[1:]) for node_id in path if node_id not in (SOURCE, TARGET)
+            ],
+            'score': float(score),
+            'distance': float(distance),
+            'path_length': int(path_length),
+            'turn_penalty': float(turn_penalty),
+            'narrow_penalty': float(narrow_penalty),
+            'sliver_penalty': float(sliver_penalty),
+        }
+
+    def enumerate_rank_candidate_paths(self,
+                                       start_state: np.ndarray,
+                                       goal_state: np.ndarray,
+                                       top_k: Optional[int] = None,
+                                       max_paths: Optional[int] = None
+                                       ) -> List[Dict]:
+        """Enumerate simple source-target paths and rank them geometrically."""
+        max_paths = int(max_paths or self.config.path_screen_max_paths)
+        top_k = int(top_k or self.config.path_screen_top_k)
+        paths = self._iter_candidate_paths(
+            start_state,
+            goal_state,
+            max(max_paths, top_k),
+            edge_values=None,
+        )
+        ranked = [
+            self._score_candidate_path(path, start_state, goal_state)
+            for path in paths[:max_paths]
+        ]
+        ranked.sort(
+            key=lambda item: (
+                item['score'],
+                item['path_length'],
+                item['distance'],
+            )
+        )
+        for rank, item in enumerate(ranked, start=1):
+            item['rank'] = rank
+        return ranked[:top_k]
+
     def _fallback_fixed_path_search(self,
                                     start_state: np.ndarray,
                                     goal_state: np.ndarray,
                                     relaxation_result: OptimizationResult,
-                                    excluded_paths: List[List[str]]) -> Optional[OptimizationResult]:
+                                    excluded_paths: List[List[str]],
+                                    edge_values: Optional[Dict[Tuple[str, str], float]] = None
+                                    ) -> Optional[OptimizationResult]:
         """Try a few nearby discrete paths when the relaxed path cannot be polished."""
         excluded = {tuple(path) for path in excluded_paths}
+        best_failed: Optional[OptimizationResult] = None
+        evaluated = relaxation_result.n_paths_evaluated
 
         for candidate_path in self._iter_candidate_paths(
             start_state,
             goal_state,
-            self.config.max_polish_path_candidates
+            self.config.max_polish_path_candidates,
+            edge_values=edge_values,
         ):
             if tuple(candidate_path) in excluded:
                 continue
@@ -890,8 +1375,9 @@ class IntegratedMIOCPSolver:
                 start_state,
                 goal_state
             )
-            candidate_result.max_integrality_gap = relaxation_result.max_integrality_gap
-            candidate_result.n_paths_evaluated = relaxation_result.n_paths_evaluated + 1
+            evaluated += 1
+            candidate_result.max_integrality_gap = 0.0
+            candidate_result.n_paths_evaluated = evaluated
 
             if candidate_result.success:
                 candidate_result.solver_status = (
@@ -899,14 +1385,102 @@ class IntegratedMIOCPSolver:
                     f"{candidate_result.solver_status}"
                 )
                 return candidate_result
+            if (
+                best_failed is None or
+                candidate_result.max_dense_region_violation < best_failed.max_dense_region_violation
+            ):
+                best_failed = candidate_result
 
-        return None
+        if best_failed is not None:
+            best_failed.n_paths_evaluated = evaluated
+        return best_failed
     
     def _compute_constraint_violation(self, g_val: np.ndarray,
                                       lbg: List[float],
                                       ubg: List[float]) -> float:
         """Maximum bound violation across all constraints."""
         return _compute_bound_violation(g_val, lbg, ubg)
+
+    def _compute_ctcs_eta_numpy(self, region_idx: int, s_minus: np.ndarray,
+                                w: np.ndarray, delta: float) -> float:
+        """Evaluate the CTCS RK4 accumulated violation integral numerically."""
+        _, eta_end = self.ctcs_integrators[region_idx](s_minus, w, delta)
+        return float(np.asarray(eta_end).reshape(-1)[0])
+
+    def _compute_dense_region_violation(self, region_idx: int, s_minus: np.ndarray,
+                                        w: np.ndarray, delta: float) -> float:
+        """Sample a local trajectory densely and return max signed H-rep violation."""
+        diagnostic = _region_dense_diagnostic(
+            self.graph,
+            self.dynamics,
+            self.control_param,
+            self.config,
+            region_idx,
+            s_minus,
+            w,
+            delta,
+        )
+        return float(diagnostic['max_violation'])
+
+    def _populate_safety_diagnostics(self, result: OptimizationResult) -> None:
+        """Attach CTCS and dense post-check diagnostics to a parsed result."""
+        result.safety_mode = self.config.safety_mode
+        ctcs_values = {}
+        dense_values = []
+        dense_diagnostics = []
+
+        for region_idx in result.path_regions:
+            if region_idx not in result.entry_states:
+                continue
+            s_minus = result.entry_states[region_idx]
+            w = result.control_params[region_idx]
+            delta = result.time_durations[region_idx]
+            eta = self._compute_ctcs_eta_numpy(region_idx, s_minus, w, delta)
+            ctcs_values[region_idx] = eta
+            dense_diag = _region_dense_diagnostic(
+                self.graph,
+                self.dynamics,
+                self.control_param,
+                self.config,
+                region_idx,
+                s_minus,
+                w,
+                delta,
+            )
+            dense_diag['ctcs_integral'] = eta
+            dense_diagnostics.append((region_idx, dense_diag))
+            dense_values.append(float(dense_diag['max_violation']))
+
+        result.continuous_violation_integrals = ctcs_values
+        result.safety_diagnostics = {
+            region_idx: diagnostic for region_idx, diagnostic in dense_diagnostics
+        }
+        result.max_continuous_violation_integral = (
+            float(max(ctcs_values.values())) if ctcs_values else 0.0
+        )
+        result.max_dense_region_violation = (
+            float(max(dense_values)) if dense_values else 0.0
+        )
+
+        if result.max_dense_region_violation > self.config.dense_check_tolerance:
+            warning = (
+                "dense post-check violation "
+                f"{result.max_dense_region_violation:.2e} > "
+                f"{self.config.dense_check_tolerance:.2e}"
+            )
+            result.solver_status = (
+                f"{result.solver_status} | WARNING: {warning}"
+                if result.solver_status else
+                f"WARNING: {warning}"
+            )
+            if self.config.fail_on_dense_violation:
+                result.success = False
+        result.transition_diagnostics = _transition_diagnostics(
+            self.graph,
+            result.path_regions,
+            result.entry_states,
+            result.exit_states,
+        )
     
     @staticmethod
     def _compute_integrality_gap(values: List[float]) -> float:
@@ -972,7 +1546,9 @@ class IntegratedMIOCPSolver:
     def _polish_relaxed_path(self, path: List[str],
                              start_state: np.ndarray,
                              goal_state: np.ndarray,
-                             relaxation_result: OptimizationResult) -> OptimizationResult:
+                             relaxation_result: OptimizationResult,
+                             edge_values: Optional[Dict[Tuple[str, str], float]] = None
+                             ) -> OptimizationResult:
         """
         Convert a relaxed integrated solution into a continuous fixed-path NLP
         solution for the extracted discrete path.
@@ -998,7 +1574,8 @@ class IntegratedMIOCPSolver:
             goal_state,
             warm_start=warm_start or None
         )
-        polished.max_integrality_gap = relaxation_result.max_integrality_gap
+        polished.max_integrality_gap = 0.0
+        polished.n_paths_evaluated = max(relaxation_result.n_paths_evaluated, 1)
         
         if polished.success:
             polished.solver_status = (
@@ -1015,13 +1592,285 @@ class IntegratedMIOCPSolver:
             start_state,
             goal_state,
             relaxation_result,
-            excluded_paths=[path]
+            excluded_paths=[path],
+            edge_values=edge_values,
         )
         if fallback_result is not None:
+            if not fallback_result.success:
+                fallback_result.solver_status = (
+                    f"{relaxation_result.solver_status} | no feasible fixed-path "
+                    f"NLP among {fallback_result.n_paths_evaluated} candidates; "
+                    f"best failed candidate: {fallback_result.solver_status}"
+                )
             return fallback_result
 
         relaxation_result.success = False
+        self._populate_safety_diagnostics(relaxation_result)
+        _apply_final_success_criteria(
+            relaxation_result,
+            self.config,
+            require_integral_final=_uses_ctcs_safety(self.config.safety_mode),
+            require_integrality=True,
+            solver_ok=False,
+        )
         return relaxation_result
+
+    @staticmethod
+    def _candidate_record(stage: str,
+                          rank: int,
+                          path: List[str],
+                          result: OptimizationResult) -> Dict:
+        return {
+            'stage': stage,
+            'rank': int(rank),
+            'path': path,
+            'path_regions': result.path_regions,
+            'success': bool(result.success),
+            'solve_time': float(result.solve_time),
+            'status': result.solver_status,
+            'cost': float(result.total_cost) if np.isfinite(result.total_cost) else None,
+            'max_dense_region_violation': float(result.max_dense_region_violation),
+            'max_ctcs_integral': float(result.max_continuous_violation_integral),
+            'defect_norm': float(result.defect_norm),
+            'constraint_violation': float(result.constraint_violation),
+            'failure_reasons': result.failure_reasons,
+        }
+
+    @staticmethod
+    def _candidate_sort_key(result: OptimizationResult) -> Tuple:
+        return (
+            0 if result.success else 1,
+            max(float(result.max_dense_region_violation), 0.0),
+            max(float(result.max_continuous_violation_integral), 0.0),
+            float(result.total_cost) if np.isfinite(result.total_cost) else np.inf,
+        )
+
+    def _repair_fixed_path(self,
+                           result: OptimizationResult,
+                           start_state: np.ndarray,
+                           goal_state: np.ndarray,
+                           rank: int,
+                           diagnostics: List[Dict],
+                           verbose: bool = False) -> OptimizationResult:
+        """Try local tightened fixed-path resolves around the worst dense region."""
+        if not self.config.repair_enabled:
+            return result
+        dense_bad_enough = (
+            self.config.dense_check_tolerance <
+            result.max_dense_region_violation <=
+            self.config.acceptable_dense_tolerance_for_repair
+        )
+        ctcs_near_miss = (
+            result.max_dense_region_violation <= self.config.dense_check_tolerance and
+            result.max_continuous_violation_integral > self.config.ctcs_tolerance and
+            result.max_continuous_violation_integral <= 1.05 * self.config.ctcs_tolerance
+        )
+        if not dense_bad_enough and not ctcs_near_miss:
+            return result
+
+        repaired_regions: List[int] = []
+        current = result
+        local_margins = dict(self.config.local_region_safety_margins)
+
+        for repair_round in range(1, int(self.config.repair_max_rounds) + 1):
+            if not current.safety_diagnostics:
+                break
+            worst_region = max(
+                current.safety_diagnostics.items(),
+                key=lambda item: float(item[1].get('max_violation', -np.inf))
+            )[0]
+            repaired_regions.append(int(worst_region))
+            local_margins[int(worst_region)] = (
+                float(local_margins.get(int(worst_region), self.config.safety_margin)) +
+                float(self.config.local_shrink_margin)
+            )
+
+            repair_config = replace(
+                self.config,
+                local_region_safety_margins=dict(local_margins),
+                tol=float(self.config.final_ipopt_tol),
+                max_iter=int(self.config.final_max_iter),
+                safety_mode=self.config.safety_mode,
+            )
+            repair_solver = PathNLPSolver(self.graph, self.dynamics, repair_config)
+            repaired = repair_solver.solve_path(
+                current.path,
+                start_state,
+                goal_state,
+                warm_start=_warm_start_from_result(current),
+                ipopt_tol=self.config.final_ipopt_tol,
+                max_iter=self.config.final_max_iter,
+                safety_mode=self.config.safety_mode,
+            )
+            repaired.pipeline_mode = self.config.pipeline_mode
+            repaired.repair_attempted = True
+            repaired.repaired_regions = list(repaired_regions)
+            repaired.solver_status = (
+                f"{repaired.solver_status} | repair round {repair_round}, "
+                f"tightened R{worst_region}"
+            )
+            diagnostics.append(
+                self._candidate_record(
+                    f"repair_round_{repair_round}",
+                    rank,
+                    current.path,
+                    repaired,
+                )
+            )
+            if verbose:
+                print(
+                    f"Repair round {repair_round}: R{worst_region}, "
+                    f"dense={repaired.max_dense_region_violation:.2e}, "
+                    f"ctcs={repaired.max_continuous_violation_integral:.2e}, "
+                    f"success={repaired.success}"
+                )
+            current = repaired
+            if current.success:
+                break
+
+        return current
+
+    def _solve_two_stage(self,
+                         start_state: np.ndarray,
+                         goal_state: np.ndarray,
+                         verbose: bool = False) -> OptimizationResult:
+        total_start = time.time()
+        stage_timings: Dict[str, float] = {}
+
+        rank_start = time.time()
+        ranked = self.enumerate_rank_candidate_paths(
+            start_state,
+            goal_state,
+            top_k=self.config.path_screen_top_k,
+            max_paths=self.config.path_screen_max_paths,
+        )
+        stage_timings['graph_screening'] = time.time() - rank_start
+        if verbose:
+            print(
+                f"Two-stage graph screening ranked {len(ranked)} paths "
+                f"in {stage_timings['graph_screening']:.3f}s"
+            )
+
+        if not ranked:
+            return OptimizationResult(
+                success=False,
+                path=[],
+                path_regions=[],
+                total_cost=np.inf,
+                solve_time=time.time() - total_start,
+                n_paths_evaluated=0,
+                solver_status="No candidate path exists in region graph",
+                pipeline_mode="two_stage",
+                stage_timings=stage_timings,
+            )
+
+        diagnostics: List[Dict] = []
+        screening_results: List[Tuple[int, Dict, OptimizationResult]] = []
+        screening_mode = self.config.screening_safety_mode or self.config.safety_mode
+
+        for item in ranked:
+            rank = int(item['rank'])
+            path = item['path']
+            solve_start = time.time()
+            screened = self.path_solver.solve_path(
+                path,
+                start_state,
+                goal_state,
+                ipopt_tol=self.config.screening_ipopt_tol,
+                max_iter=self.config.screening_max_iter,
+                safety_mode=screening_mode,
+            )
+            stage_timings[f"screen_path_{rank}"] = time.time() - solve_start
+            screened.pipeline_mode = "two_stage"
+            screening_results.append((rank, item, screened))
+            diagnostics.append(
+                self._candidate_record("screening", rank, path, screened)
+            )
+            if verbose:
+                print(
+                    f"Screen path {rank}/{len(ranked)}: "
+                    f"time={screened.solve_time:.3f}s dense="
+                    f"{screened.max_dense_region_violation:.2e} "
+                    f"ctcs={screened.max_continuous_violation_integral:.2e} "
+                    f"success={screened.success}"
+                )
+
+        ordered = sorted(screening_results, key=lambda item: self._candidate_sort_key(item[2]))
+        best: Optional[OptimizationResult] = None
+        n_polished = 0
+        early_stopped = False
+
+        for rank, item, screened in ordered[:self.config.max_polish_path_candidates]:
+            solve_start = time.time()
+            final = self.path_solver.solve_path(
+                item['path'],
+                start_state,
+                goal_state,
+                warm_start=_warm_start_from_result(screened),
+                ipopt_tol=self.config.final_ipopt_tol,
+                max_iter=self.config.final_max_iter,
+                safety_mode=self.config.safety_mode,
+            )
+            stage_timings[f"final_path_{rank}"] = time.time() - solve_start
+            final.pipeline_mode = "two_stage"
+            n_polished += 1
+            diagnostics.append(
+                self._candidate_record("final", rank, item['path'], final)
+            )
+            if verbose:
+                print(
+                    f"Final polish path {rank}: time={final.solve_time:.3f}s "
+                    f"dense={final.max_dense_region_violation:.2e} "
+                    f"ctcs={final.max_continuous_violation_integral:.2e} "
+                    f"success={final.success}"
+                )
+
+            repaired = self._repair_fixed_path(
+                final,
+                start_state,
+                goal_state,
+                rank,
+                diagnostics,
+                verbose=verbose,
+            )
+            if repaired is not final:
+                stage_timings[f"repair_path_{rank}"] = max(
+                    0.0,
+                    sum(
+                        record['solve_time']
+                        for record in diagnostics
+                        if record['rank'] == rank and record['stage'].startswith('repair_round_')
+                    )
+                )
+            candidate = repaired
+            if best is None or self._candidate_sort_key(candidate) < self._candidate_sort_key(best):
+                best = candidate
+            if candidate.success and self.config.early_stop_on_feasible:
+                early_stopped = True
+                break
+
+        if best is None:
+            _, item, best_screen = ordered[0]
+            best = best_screen
+            best.path = item['path']
+
+        best.pipeline_mode = "two_stage"
+        best.candidate_paths_ranked = ranked
+        best.n_paths_screened = len(screening_results)
+        best.n_paths_polished = n_polished
+        best.n_paths_evaluated = len(screening_results) + n_polished
+        best.early_stopped = early_stopped
+        best.per_candidate_diagnostics = diagnostics
+        best.stage_timings = stage_timings
+        best.solve_time = time.time() - total_start
+        if best.repair_attempted:
+            best.solver_status = f"{best.solver_status} | two-stage repaired"
+        else:
+            best.repair_attempted = any(
+                record['stage'].startswith('repair_round_')
+                for record in diagnostics
+            )
+        return best
     
     def solve(self, start_state: np.ndarray, goal_state: np.ndarray,
               verbose: bool = False) -> OptimizationResult:
@@ -1030,6 +1879,9 @@ class IntegratedMIOCPSolver:
         relaxation of the MIOCP.
         """
         start_time = time.time()
+
+        if self.config.pipeline_mode == "two_stage":
+            return self._solve_two_stage(start_state, goal_state, verbose=verbose)
 
         try:
             result = self._build_and_solve_integrated_miocp(
@@ -1047,6 +1899,7 @@ class IntegratedMIOCPSolver:
             )
 
         result.solve_time = time.time() - start_time
+        result.pipeline_mode = "integrated"
         return result
     
     def _build_and_solve_integrated_miocp(self, start_state: np.ndarray,
@@ -1095,8 +1948,9 @@ class IntegratedMIOCPSolver:
                 heading = float(np.arctan2(direction[1], direction[0]))
             
             distance = float(np.linalg.norm(direction))
+            delta_min = max(self.config.delta_min, self.config.active_delta_min)
             delta_init = max(
-                self.config.delta_min,
+                delta_min,
                 min(self.config.delta_max,
                     distance / max(abs(self.config.v_max), 1e-6))
             )
@@ -1276,18 +2130,25 @@ class IntegratedMIOCPSolver:
             add_leq(w_vars[node_id] - self.control_big_m * p)
             add_leq(-w_vars[node_id] - self.control_big_m * p)
             add_leq(delta_vars[node_id] - self.config.delta_max * p)
-            add_leq(self.config.delta_min * p - delta_vars[node_id])
+            add_leq(max(self.config.delta_min, self.config.active_delta_min) * p - delta_vars[node_id])
             add_leq(rho_vars[node_id] - self.rho_big_m * p)
         
         # Exact defect dynamics and local cost epigraph.
+        ctcs_outputs = {}
         for node_id in region_nodes:
+            region = self.graph.get_region_by_id(node_id)
             s_minus = s_minus_vars[node_id]
             s_plus = s_plus_vars[node_id]
             w = w_vars[node_id]
             delta = delta_vars[node_id]
             rho = rho_vars[node_id]
             
-            add_eq(s_plus - self.F_endpoint(s_minus, w, delta))
+            if _uses_ctcs_safety(self.config.safety_mode):
+                F_result, eta_end = self.ctcs_integrators[region.index](s_minus, w, delta)
+                ctcs_outputs[node_id] = (F_result, eta_end)
+            else:
+                F_result = self.F_endpoint(s_minus, w, delta)
+            add_eq(s_plus - F_result)
             
             local_cost = self.local_cost_fn(
                 s_minus, w, delta,
@@ -1314,12 +2175,23 @@ class IntegratedMIOCPSolver:
                 closure_violation = ca.mtimes(A_dm, endpoint) - b_dm - boundary_tol
                 add_leq(closure_violation - self.position_big_m * (1 - p))
 
-            mesh_positions = self.mesh_sampler(s_minus, w, delta)
-            
-            for k in _interior_mesh_indices(n_mesh):
-                pos = mesh_positions[k, :]
-                violation = ca.mtimes(A_dm, pos.T) - b_dm + self.config.safety_margin
-                add_leq(violation - self.position_big_m * (1 - p))
+            if _uses_mesh_safety(self.config.safety_mode):
+                mesh_positions = self.mesh_sampler(s_minus, w, delta)
+                
+                for k in _interior_mesh_indices(n_mesh):
+                    pos = mesh_positions[k, :]
+                    violation = (
+                        ca.mtimes(A_dm, pos.T) - b_dm +
+                        _region_safety_margin(self.config, region.index)
+                    )
+                    add_leq(violation - self.position_big_m * (1 - p))
+
+            if _uses_ctcs_safety(self.config.safety_mode):
+                _, eta_end = ctcs_outputs[node_id]
+                add_leq(
+                    eta_end - self.config.ctcs_tolerance -
+                    self.config.ctcs_eta_big_m * (1 - p)
+                )
         
         # Interface membership and on/off coupling for region-region edges.
         for edge in self.graph.region_edges:
@@ -1504,10 +2376,23 @@ class IntegratedMIOCPSolver:
             self.control_param
         )
         
-        if result.success and (
-            result.max_integrality_gap > 1e-3 or result.max_connection_gap > 1e-4
+        if (
+            (not success) or
+            result.max_integrality_gap > 1e-3 or
+            result.max_connection_gap > 1e-4
         ):
-            return self._polish_relaxed_path(path, start_state, goal_state, result)
+            return self._polish_relaxed_path(
+                path, start_state, goal_state, result, edge_values=edge_values
+            )
+
+        self._populate_safety_diagnostics(result)
+        _apply_final_success_criteria(
+            result,
+            self.config,
+            require_integral_final=_uses_ctcs_safety(self.config.safety_mode),
+            require_integrality=True,
+            solver_ok=success,
+        )
         
         return result
 
@@ -1522,6 +2407,8 @@ def create_integrated_optimizer_from_config(graph: RegionGraph,
     dynamics_config = config_dict.get('dynamics', {})
     optimizer_config = config_dict.get('optimizer', {})
     control_config = config_dict.get('control', {})
+    pipeline_mode = optimizer_config.get('pipeline_mode', 'integrated')
+    default_polish_candidates = 5 if pipeline_mode == 'two_stage' else 20
     
     opt_config = OptimizationConfig(
         a=cost_config.get('a', 1.0),
@@ -1532,6 +2419,15 @@ def create_integrated_optimizer_from_config(graph: RegionGraph,
         n_mesh_points=shooting_config.get('n_mesh_points', 3),
         n_control_segments=control_config.get('n_segments', 2),
         safety_margin=shooting_config.get('safety_margin', 0.02),
+        safety_mode=shooting_config.get('safety_mode', 'both'),
+        ctcs_tolerance=shooting_config.get('ctcs_tolerance', 1.0e-6),
+        ctcs_penalty=shooting_config.get('ctcs_penalty', 'squared_hinge'),
+        ctcs_integral_mode=shooting_config.get('ctcs_integral_mode', 'normalized'),
+        ctcs_use_rk4_stages=shooting_config.get('ctcs_use_rk4_stages', True),
+        ctcs_eta_big_m=shooting_config.get('ctcs_eta_big_m', 100.0),
+        dense_check_points=shooting_config.get('dense_check_points', 1000),
+        dense_check_tolerance=shooting_config.get('dense_check_tolerance', 1.0e-4),
+        fail_on_dense_violation=shooting_config.get('fail_on_dense_violation', True),
         boundary_tolerance=shooting_config.get('boundary_tolerance', 1e-8),
         delta_min=dynamics_config.get('delta_min', 0.1),
         delta_max=dynamics_config.get('delta_max', 10.0),
@@ -1539,6 +2435,10 @@ def create_integrated_optimizer_from_config(graph: RegionGraph,
         v_max=dynamics_config.get('v_max', 2.0),
         omega_min=dynamics_config.get('omega_min', -np.pi),
         omega_max=dynamics_config.get('omega_max', np.pi),
+        active_delta_min=shooting_config.get(
+            'active_delta_min',
+            max(dynamics_config.get('delta_min', 0.1), 0.05)
+        ),
         M_position=optimizer_config.get('big_M', {}).get('position', 20.0),
         M_interface=optimizer_config.get('big_M', {}).get('interface', 20.0),
         M_time=optimizer_config.get('big_M', {}).get('time', 100.0),
@@ -1546,7 +2446,29 @@ def create_integrated_optimizer_from_config(graph: RegionGraph,
         max_iter=optimizer_config.get('ipopt', {}).get('max_iter', 3500),
         tol=optimizer_config.get('ipopt', {}).get('tol', 1e-6),
         print_level=optimizer_config.get('ipopt', {}).get('print_level', 0),
-        max_polish_path_candidates=optimizer_config.get('path_polish_candidates', 3),
+        max_polish_path_candidates=optimizer_config.get(
+            'max_polish_path_candidates',
+            optimizer_config.get('path_polish_candidates', default_polish_candidates)
+        ),
+        final_connection_tolerance=optimizer_config.get('final_connection_tolerance', 1e-6),
+        final_defect_tolerance=optimizer_config.get('final_defect_tolerance', 1e-6),
+        final_integrality_tolerance=optimizer_config.get('final_integrality_tolerance', 1e-6),
+        pipeline_mode=pipeline_mode,
+        path_screen_top_k=optimizer_config.get('path_screen_top_k', 5),
+        path_screen_max_paths=optimizer_config.get('path_screen_max_paths', 1500),
+        early_stop_on_feasible=optimizer_config.get('early_stop_on_feasible', True),
+        acceptable_dense_tolerance_for_repair=optimizer_config.get(
+            'acceptable_dense_tolerance_for_repair', 5e-3
+        ),
+        screening_ipopt_tol=optimizer_config.get('screening_ipopt_tol', 1e-4),
+        screening_max_iter=optimizer_config.get('screening_max_iter', 500),
+        final_ipopt_tol=optimizer_config.get('final_ipopt_tol', 1e-6),
+        final_max_iter=optimizer_config.get('final_max_iter', 3000),
+        repair_enabled=optimizer_config.get('repair_enabled', True),
+        repair_max_rounds=optimizer_config.get('repair_max_rounds', 2),
+        local_shrink_margin=optimizer_config.get('local_shrink_margin', 0.003),
+        adaptive_refine_enabled=optimizer_config.get('adaptive_refine_enabled', True),
+        screening_safety_mode=optimizer_config.get('screening_safety_mode', None),
     )
     
     return IntegratedMIOCPSolver(graph, dynamics, opt_config)

@@ -43,6 +43,9 @@ class ExperimentResult:
             f"  Total Cost: {self.optimization_result.total_cost:.4f}",
             f"  Solve Time: {self.optimization_result.solve_time:.3f} s",
             f"  Paths Evaluated: {self.optimization_result.n_paths_evaluated}",
+            f"  Safety Mode: {self.optimization_result.safety_mode}",
+            f"  Max CTCS Integral: {self.optimization_result.max_continuous_violation_integral:.2e}",
+            f"  Max Dense Region Violation: {self.optimization_result.max_dense_region_violation:.2e}",
         ]
         
         if self.optimization_result.success:
@@ -154,8 +157,8 @@ class ExperimentRunner:
                     obstacles=prepared.environment.obstacles,
                     title=f"GCS-MMS: {prepared.resolved.name}",
                 )
-                plt.show()
                 fig.savefig(f"{prefix}_result.png")
+                plt.close(fig)
                 print(f"Saved: {prefix}_result.png")
 
             if save_gif and opt_result.success:
@@ -200,7 +203,15 @@ class ExperimentRunner:
                 "solve_time": opt_result.solve_time,
                 "total_cost": opt_result.total_cost,
                 "paths_evaluated": opt_result.n_paths_evaluated,
+                "pipeline_mode": opt_result.pipeline_mode,
+                "n_paths_screened": opt_result.n_paths_screened,
+                "n_paths_polished": opt_result.n_paths_polished,
+                "early_stopped": opt_result.early_stopped,
+                "repair_attempted": opt_result.repair_attempted,
                 "path_length": len(opt_result.path_regions),
+                "safety_mode": opt_result.safety_mode,
+                "max_ctcs_integral": opt_result.max_continuous_violation_integral,
+                "max_dense_region_violation": opt_result.max_dense_region_violation,
             }
 
         filename = os.path.join(self.output_dir, "benchmark_summary.json")

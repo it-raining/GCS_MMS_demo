@@ -58,3 +58,41 @@ gui/GL/gliDump.o: gui/GL/gliDump.cpp gui/GL/gliDump.h gui/GL/gli.h \
 gui/GL/gliFont.o: gui/GL/gliFont.cpp gui/GL/gliFont.h gui/GL/gli.h \
  gui/GL/glut.h
 gui/GL/gliTexture.o: gui/GL/gliTexture.cpp gui/GL/gliTexture.h
+src/acd2d_concavity.o: src/acd2d_concavity.cpp src/acd2d_concavity.h \
+ src/acd2d_data.h src/mathtool/acd2d_Point.h src/mathtool/acd2d_Vector.h \
+ src/mathtool/acd2d_Basic.h src/acd2d_util.h src/acd2d.h src/acd2d_core.h \
+ src/acd2d_bridge.h src/hull/acd2d_hull.h src/acd2d_data.h \
+ src/edge_visibility/acd2d_edge_visibility.h
+src/acd2d_core.o: src/acd2d_core.cpp src/acd2d.h src/acd2d_core.h \
+ src/acd2d_data.h src/mathtool/acd2d_Point.h src/mathtool/acd2d_Vector.h \
+ src/mathtool/acd2d_Basic.h src/acd2d_concavity.h src/acd2d_util.h \
+ src/acd2d_bridge.h src/hull/acd2d_hull.h src/acd2d_data.h \
+ src/acd2d_cut.h src/acd2d_dir.h \
+ src/edge_visibility/acd2d_edge_visibility.h
+src/acd2d_data.o: src/acd2d_data.cpp src/acd2d_data.h \
+ src/mathtool/acd2d_Point.h src/mathtool/acd2d_Vector.h \
+ src/mathtool/acd2d_Basic.h src/acd2d_util.h src/acd2d.h src/acd2d_core.h \
+ src/acd2d_concavity.h src/acd2d_bridge.h src/hull/acd2d_hull.h \
+ src/acd2d_data.h src/acd2d_eigen.h src/acd2d_dir.h \
+ src/edge_visibility/acd2d_edge_visibility.h
+src/mathtool/acd2d_Basic.o: src/mathtool/acd2d_Basic.cpp \
+ src/mathtool/acd2d_Basic.h
+src/hull/acd2d_hull.o: src/hull/acd2d_hull.cpp src/acd2d_bridge.h \
+ src/acd2d_data.h src/mathtool/acd2d_Point.h src/mathtool/acd2d_Vector.h \
+ src/mathtool/acd2d_Basic.h src/acd2d_util.h src/acd2d.h src/acd2d_core.h \
+ src/acd2d_concavity.h src/acd2d_bridge.h src/hull/acd2d_hull.h \
+ src/acd2d_data.h
+src/hull/acd2d_hull_use_qhull.o: src/hull/acd2d_hull_use_qhull.cpp
+src/edge_visibility/acd2d_edge_visibility.o: \
+ src/edge_visibility/acd2d_edge_visibility.cpp \
+ src/edge_visibility/acd2d_ev_data.h src/acd2d_data.h \
+ src/mathtool/acd2d_Point.h src/mathtool/acd2d_Vector.h \
+ src/mathtool/acd2d_Basic.h src/edge_visibility/acd2d_edge_visibility.h \
+ src/edge_visibility/acd2d_ev_function.h \
+ src/edge_visibility/acd2d_ev_shortest_path.h
+src/edge_visibility/acd2d_ev_function.o: \
+ src/edge_visibility/acd2d_ev_function.cpp \
+ src/edge_visibility/acd2d_ev_function.h \
+ src/edge_visibility/acd2d_ev_data.h src/acd2d_data.h \
+ src/mathtool/acd2d_Point.h src/mathtool/acd2d_Vector.h \
+ src/mathtool/acd2d_Basic.h libs/FIST/data.h libs/FIST/triangulate.h

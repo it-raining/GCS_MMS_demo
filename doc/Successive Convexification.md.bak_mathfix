@@ -1,0 +1,1417 @@
+Dưới đây là bản dịch **Section 2 — Problem Formulation** của paper *Successive Convexification for Trajectory Optimization with Continuous-Time Constraint Satisfaction*, giữ nguyên cấu trúc mục, số phương trình và ký hiệu để bạn đối chiếu với bản gốc. 
+
+---
+
+# 2 Problem Formulation
+
+# 2 Formulation bài toán
+
+Mục này mô tả phép biến đổi một bài toán điều khiển tối ưu có ràng buộc dọc đường và thời gian kết thúc tự do thành một bài toán điều khiển tối ưu có thời gian kết thúc cố định, thông qua co giãn thời gian tổng quát và tái formulation ràng buộc. Việc tái formulation ràng buộc bao gồm chuyển đổi các ràng buộc dọc đường thành một bài toán giá trị biên hai điểm cho một hệ động lực phụ.
+
+---
+
+## 2.1 Notation
+
+## 2.1 Ký hiệu
+
+Chúng tôi sử dụng các ký hiệu sau trong phần còn lại của thảo luận. Tập các số thực được ký hiệu là (\mathbb{R}), tập các số thực không âm là $\mathbb{R}_+$, tập các ma trận thực kích thước (n\times m) là (\mathbb{R}^{n\times m}), và tập các vector thực kích thước (n\times 1) là (\mathbb{R}^n). Phép nối hai vector (v\in\mathbb{R}^n) và (u\in\mathbb{R}^m) được ký hiệu là ((v,u)\in\mathbb{R}^{n+m}), phép nối hai ma trận (A\in\mathbb{R}^{l\times m}) và (B\in\mathbb{R}^{l\times n}) được ký hiệu là ([A\ B]\in\mathbb{R}^{l\times(m+n)}), tích Descartes của hai tập (C) và (D) được ký hiệu là (C\times D), và tích Kronecker được ký hiệu là (\otimes).
+
+Vector toàn các số một trong (\mathbb{R}^n) được ký hiệu là (\mathbf{1}*n), ma trận đơn vị trong (\mathbb{R}^{n\times n}) là (I_n), và ma trận toàn số không trong (\mathbb{R}^{n\times m}) là (0*{n\times m}). Khi chỉ số dưới bị lược bỏ, kích thước được suy ra từ ngữ cảnh. Với mọi vô hướng (v), ta định nghĩa
+
+[
+|v|_+ = \max{0,v}.
+]
+
+Các phép toán (|\Box|_+), (|\Box|), (\Box^2), và các hợp thành của chúng, được áp dụng theo từng phần tử đối với vector. Chuẩn Euclid của một vector (v) được ký hiệu là (|v|). Hàm chỉ thị của một tập lồi (D) được ký hiệu là (\tilde I_D) — xem [56, Ví dụ 3.1] — và nón pháp tuyến của nó tại (x) được ký hiệu là (N_D(x)) [57, Định nghĩa 5.2.3].
+
+Dưới vi phân của một hàm (f), được đánh giá tại (x), là một tập được ký hiệu là (\partial f(x)), và các phần tử của nó được gọi là các subgradient. Gradient của một hàm khả vi (g:\mathbb{R}^n\to\mathbb{R}^l) theo biến (z\in\mathbb{R}^m), được đánh giá tại (x\in\mathbb{R}^n), được ký hiệu là
+
+[
+\nabla_z g(x)\in\mathbb{R}^{l\times m},
+]
+
+trong đó các phần tử của (z) có thể bao gồm một tập con hoặc tập cha của các đối số của (g), không phụ thuộc vào thứ tự; chỉ số dưới (z) được lược bỏ nếu nó trùng với danh sách đối số của (g).
+
+(Sub)gradient của một hàm giá trị vô hướng tại một điểm được định nghĩa là một vector hàng, ví dụ thuộc (\mathbb{R}^{1\times m}). (Sub)gradient của một hàm giá trị vector là một ma trận gồm các (sub)gradient của các phần tử vô hướng của nó theo từng hàng. Cụ thể, các đạo hàm riêng của hàm
+
+[
+(u,v)\mapsto h(u,v),
+]
+
+được đánh giá tại (\bar u,\bar v), lần lượt được ký hiệu là
+
+[
+\nabla_u h(\bar u,\bar v),\qquad \nabla_v h(\bar u,\bar v),
+]
+
+với đối số được suy ra từ ngữ cảnh khi bị lược bỏ. Hơn nữa, ký hiệu
+
+[
+\frac{d\Box(\varsigma)}{d\varsigma}
+]
+
+biểu diễn đạo hàm theo một biến vô hướng.
+
+---
+
+## 2.2 Optimal Control Problem
+
+## 2.2 Bài toán điều khiển tối ưu
+
+Chúng tôi xét một lớp bài toán điều khiển tối ưu có thời gian kết thúc tự do cho các hệ động lực phi tuyến với các ràng buộc phi lồi trên trạng thái và đầu vào, được cho bởi
+
+[
+\underset{x,u,t_f}{\text{minimize}}\quad
+L(t_f,x(t_f))
+\tag{1a}
+]
+
+subject to
+
+[
+\dot x(t)=f(t,x(t),u(t))
+\quad \text{a.e. } t\in[t_i,t_f]
+\tag{1b}
+]
+
+[
+g(t,x(t),u(t))\le 0_{n_g}
+\quad \text{a.e. } t\in[t_i,t_f]
+\tag{1c}
+]
+
+[
+h(t,x(t),u(t))=0_{n_h}
+\quad \text{a.e. } t\in[t_i,t_f]
+\tag{1d}
+]
+
+[
+P(t_i,x(t_i),t_f,x(t_f))\le 0_{n_P}
+\tag{1e}
+]
+
+[
+Q(t_i,x(t_i),t_f,x(t_f))=0_{n_Q}.
+\tag{1f}
+]
+
+Ở đây, đạo hàm theo thời gian (t\in[t_i,t_f]) trong (1b) được ký hiệu là
+
+[
+\dot \Box=\frac{d\Box}{dt}.
+]
+
+Chúng tôi giả sử rằng hàm chi phí trạng thái cuối
+
+[
+L:\mathbb{R}_+\times\mathbb{R}^{n_x}\to\mathbb{R},
+]
+
+hàm động lực
+
+[
+f:\mathbb{R}_+\times\mathbb{R}^{n_x}\times\mathbb{R}^{n_u}\to\mathbb{R}^{n_x},
+]
+
+các hàm ràng buộc dọc đường
+
+[
+g:\mathbb{R}_+\times\mathbb{R}^{n_x}\times\mathbb{R}^{n_u}\to\mathbb{R}^{n_g},
+]
+
+[
+h:\mathbb{R}_+\times\mathbb{R}^{n_x}\times\mathbb{R}^{n_u}\to\mathbb{R}^{n_h},
+]
+
+và các hàm ràng buộc điều kiện biên
+
+[
+P:\mathbb{R}*+\times\mathbb{R}^{n_x}\times\mathbb{R}*+\times\mathbb{R}^{n_x}\to\mathbb{R}^{n_P},
+]
+
+[
+Q:\mathbb{R}*+\times\mathbb{R}^{n_x}\times\mathbb{R}*+\times\mathbb{R}^{n_x}\to\mathbb{R}^{n_Q},
+]
+
+đều khả vi liên tục. Các ràng buộc bất đẳng thức và đẳng thức trong (1c)–(1f) được hiểu theo từng phần tử. Thời gian ban đầu (t_i\in\mathbb{R}*+) là cố định, trong khi thời gian cuối (t_f\in\mathbb{R}*+) là một biến tự do, tức biến quyết định.
+
+Để đơn giản, chúng tôi lược bỏ các tham số [2, Eq. 1] của động lực học hệ thống và các ràng buộc trong (1). Với những sửa đổi tối thiểu, phần phát triển tiếp theo cũng có thể xử lý các tham số như những biến quyết định. Lưu ý rằng bài toán trên có thể là một bài toán tối ưu hóa quỹ đạo phi lồi do:
+i) động lực học phi tuyến, tức (f) là một hàm phi tuyến;
+ii) thời gian cuối là tự do;
+iii) các hàm phi tuyến (h) và (Q);
+iv) các hàm phi lồi (g) và (P).
+
+Chúng tôi giả sử rằng đầu vào điều khiển
+
+[
+u:[t_i,t_f]\to\mathbb{R}^{n_u}
+]
+
+là một hàm liên tục từng đoạn. Vì (f) khả vi liên tục, điều này bảo đảm sự tồn tại và duy nhất của một hàm liên tục tuyệt đối
+
+[
+x:[t_i,t_f]\to\mathbb{R}^{n_x},
+]
+
+tức quỹ đạo trạng thái, thỏa mãn (1b) gần như mọi nơi và thỏa mãn phương trình tích phân sau:
+
+[
+x(t)=x_i+\int_{t_i}^{t} f(\gamma,x(\gamma),u(\gamma)),d\gamma,
+]
+
+trong đó
+
+[
+x(t_i)=x_i
+]
+
+là trạng thái ban đầu. Lưu ý rằng sự tồn tại và duy nhất của quỹ đạo trạng thái có thể được bảo đảm dưới các giả thiết yếu hơn; độc giả có thể tham khảo [58, Sec. 3.3.1] và [59, Sec. II.3] để biết thảo luận chi tiết. Chúng tôi cũng yêu cầu giả thiết bị chặn sau đây, dựa trên Bổ đề Gronwall [60, Chap. 4, Prop. 1.4].
+
+**Assumption 1.** Với mọi tập compact (U\subset\mathbb{R}^{n_u}) và (t_f>t_i\ge0), tồn tại các hằng số dương (\vartheta) và (\varrho) sao cho
+
+[
+|f(t,x,u)|\le \vartheta|x|+\varrho
+]
+
+với mọi
+
+[
+(t,x,u)\in[t_i,t_f]\times\mathbb{R}^{n_x}\times U.
+]
+
+Lưu ý rằng Assumption 1 không phải lúc nào cũng đúng. Xét
+
+[
+f(t,x,u)=x^2.
+]
+
+Với mọi (\vartheta) và (\varrho) dương, khi (x) trở nên đủ lớn, Assumption 1 không còn hợp lệ. Tuy vậy, đối với các hệ vật lý, ta có thể định nghĩa một tập compact
+
+[
+X\subset\mathbb{R}^{n_x},
+]
+
+chứa tất cả các trạng thái có ý nghĩa vật lý. Bất kỳ trạng thái nào không nằm trong (X) có thể được xem là không khả thi. Do đó, ta tạo một hàm động lực học đã sửa đổi sao cho nó thỏa Assumption 1 và đồng nhất với hàm động lực học gốc trên (X).
+
+Cụ thể, với mọi tập mở (W) chứa (X), tồn tại một hàm trơn
+
+[
+\omega:\mathbb{R}^{n_x}\to\mathbb{R}
+]
+
+sao cho
+
+[
+\omega(x)=1,\quad \forall x\in X,
+]
+
+và support của (\omega) là compact và nằm trong (W), như được chỉ ra trong [61, Thm. 8.18]. Vì vậy, ta có thể thay thế hàm (f) trong (1b) bằng (\omega f), là hàm có support compact trong (\mathbb{R}^{n_x}), qua đó bảo đảm Assumption 1. Lưu ý rằng việc đưa (\omega) vào chỉ nhằm phục vụ các chứng minh của những kết quả được thảo luận trong các mục tiếp theo; nó không cần thiết trong hiện thực thực tế.
+
+Bài toán điều khiển tối ưu (1) được đặt ở dạng Mayer [58, Sec. 3.3.2], mà không mất tính tổng quát. Bài toán gốc có thể được cho ở dạng Bolza hoặc Lagrange, trong đó hàm mục tiêu chứa tích phân của một hàm chi phí chạy khả vi liên tục
+
+[
+L_r:\mathbb{R}_+\times\mathbb{R}^{n_x}\times\mathbb{R}^{n_u}\to\mathbb{R},
+]
+
+được cho bởi
+
+[
+\int_{t_i}^{t_f} L_r(t,x(t),u(t)),dt,
+]
+
+là đại lượng xác định tốt khi (x) là một quỹ đạo trạng thái và (u) là đầu vào điều khiển liên tục từng đoạn tương ứng. Dạng Mayer thu được từ dạng Lagrange và Bolza bằng cách tái formulation tương đương tích phân của (L_r) như một hệ động lực mới
+
+[
+\dot l(t)=L_r(t,x(t),u(t))
+\tag{2}
+]
+
+và thêm (l(t_f)) như một chi phí trạng thái cuối vào hàm mục tiêu, đồng thời chỉ định điều kiện ban đầu
+
+[
+l(t_i)=0.
+]
+
+Chúng tôi đề xuất một phương pháp giải dựa trên SCP và multiple-shooting [46], chỉ yêu cầu thông tin bậc một. Gradient của tích phân của (L_r) có thể được tính thông qua các độ nhạy bậc một [62, Sec. 4.2] của hệ động lực (2), với mức nỗ lực tương tự về chất như tuyến tính hóa (1b). Vì vậy, chuyển sang dạng Mayer là có lợi để gom phần lớn nỗ lực tính gradient vào một nơi, điều này hiệu quả cho các hiện thực số.
+
+Hơn nữa, tích phân của hàm chi phí chạy có thể là lồi hoặc phi lồi. Tuy nhiên, trong trường hợp lồi, tích phân thường không thể được tái formulation thành một ràng buộc nón chuẩn tắc với sự hỗ trợ của các biến slack bổ sung — xem Section 5.1 để biết chi tiết hơn. Ngoài ra, một hàm chi phí chạy lồi trong bài toán có thời gian kết thúc tự do sẽ trở thành phi lồi sau khi chuyển thành bài toán có thời gian kết thúc cố định thông qua kỹ thuật co giãn thời gian được mô tả trong Section 2.4.
+
+Trong phần phát triển tiếp theo, trừ khi có phát biểu khác, chúng tôi giả sử rằng hệ động lực (1b), hàm chi phí trạng thái cuối (L), và điều kiện biên (1f) đã mã hóa mọi hạng chi phí chạy mong muốn.
+
+---
+
+## 2.3 Constraint Reformulation
+
+## 2.3 Tái formulation ràng buộc
+
+Để tái formulation các ràng buộc dọc đường (1c) và (1d), chúng tôi xét các hàm phạt ngoài liên tục
+
+[
+q_i:\mathbb{R}*+\times\mathbb{R}^{n_x}\times\mathbb{R}^{n_u}\to\mathbb{R}*+,
+\quad i=1,\ldots,n_g
+\tag{3a}
+]
+
+[
+q_i(z)
+\begin{cases}
+=0 & \text{if } z\le 0,\
+
+> 0 & \text{otherwise},
+> \end{cases}
+> \tag{3b}
+> ]
+
+[
+p_j:\mathbb{R}*+\times\mathbb{R}^{n_x}\times\mathbb{R}^{n_u}\to\mathbb{R}*+,
+\quad j=1,\ldots,n_h
+\tag{3c}
+]
+
+[
+p_j(z)
+\begin{cases}
+=0 & \text{if } z=0,\
+
+> 0 & \text{otherwise},
+> \end{cases}
+> \tag{3d}
+> ]
+
+và hàm phạt
+
+[
+\Lambda:\mathbb{R}*+\times\mathbb{R}^{n_x}\times\mathbb{R}^{n_u}\to\mathbb{R}*+
+]
+
+được định nghĩa bởi
+
+[
+\Lambda(t,x,u)
+==============
+
+\sum_{i=1}^{n_g} q_i(g_i(t,x,u))
++
+\sum_{j=1}^{n_h} p_j(h_j(t,x,u)).
+\tag{4}
+]
+
+Lưu ý rằng (g_i), (i=1,\ldots,n_g), và (h_j), (j=1,\ldots,n_h), lần lượt ký hiệu các phần tử giá trị vô hướng của các hàm (g) và (h). Có thể chỉ ra một cách trực tiếp rằng ánh xạ
+
+[
+t\mapsto \Lambda(t,x(t),u(t))
+]
+
+là liên tục từng đoạn trên ([t_i,t_f]) khi (x) là một quỹ đạo trạng thái và (u) là đầu vào điều khiển liên tục từng đoạn tương ứng.
+
+**Lemma 2.** Các ràng buộc dọc đường (1c) và (1d) được thỏa bởi (x(t)) và (u(t)) gần như mọi nơi trên (t\in[t_i,t_f]) khi và chỉ khi
+
+[
+\int_{t_i}^{t_f} \Lambda(t,x(t),u(t)),dt=0.
+\tag{5}
+]
+
+**Proof.** Với mỗi (t\in[t_i,t_f]), (\Lambda(t,x(t),u(t))) là không âm vì
+
+[
+q_i(g_i(t,x(t),u(t)))
+]
+
+và
+
+[
+p_j(h_j(t,x(t),u(t)))
+]
+
+đều không âm. Vì ánh xạ
+
+[
+t\mapsto \Lambda(t,x(t),u(t))
+]
+
+là liên tục từng đoạn, (5) đúng khi và chỉ khi
+
+[
+\Lambda(t,x(t),u(t))=0
+]
+
+gần như mọi nơi trên (t\in[t_i,t_f]).
+
+Khi đó,
+
+[
+q_i(g_i(t,x(t),u(t)))=0
+]
+
+và
+
+[
+p_j(h_j(t,x(t),u(t)))=0
+]
+
+gần như mọi nơi trên (t\in[t_i,t_f]), điều này tương đương với
+
+[
+g_i(t,x(t),u(t))\le0
+]
+
+và
+
+[
+h_j(t,x(t),u(t))=0
+]
+
+gần như mọi nơi trên (t\in[t_i,t_f]).
+
+Tiếp theo, chúng tôi mở rộng hệ động lực bằng một trạng thái bổ sung để tích lũy các mức vi phạm ràng buộc, và áp đặt các điều kiện biên tuần hoàn lên nó nhằm bảo đảm thỏa mãn ràng buộc trong thời gian liên tục.
+
+**Corollary 3.** Hệ vi phân–đại số
+
+[
+\dot x(t)=f(t,x(t),u(t))
+\tag{6a}
+]
+
+[
+g(t,x(t),u(t))\le0
+\tag{6b}
+]
+
+[
+h(t,x(t),u(t))=0
+\tag{6c}
+]
+
+được thỏa bởi (x) và (u) gần như mọi nơi trong ([t_i,t_f]) khi và chỉ khi (x) và (u) giải bài toán giá trị biên trên ([t_i,t_f])
+
+[
+\dot x(t)=f(t,x(t),u(t))
+\tag{7a}
+]
+
+[
+\dot y(t)=\Lambda(t,x(t),u(t))
+\tag{7b}
+]
+
+[
+y(0)=y(t_f).
+\tag{7c}
+]
+
+**Proof.** Giả sử rằng (x) và (u) thỏa (1b), (1c), và (1d) gần như mọi nơi trong ([t_i,t_f]). Vì ánh xạ
+
+[
+t\mapsto \Lambda(t,x(t),u(t))
+]
+
+là liên tục từng đoạn trên ([t_i,t_f]), tồn tại duy nhất một quỹ đạo trạng thái
+
+[
+y:[t_i,t_f]\to\mathbb{R}
+]
+
+thỏa (7b) gần như mọi nơi trong ([t_i,t_f]) với điều kiện ban đầu
+
+[
+y(t_i)=0.
+]
+
+Khi đó,
+
+[
+y(t_f)=0
+]
+
+khi và chỉ khi (5) đúng. Vì vậy, từ Lemma 2, các ràng buộc dọc đường (1c) và (1d) được thỏa gần như mọi nơi trong ([t_i,t_f]).
+
+Theo chiều ngược lại, cho (x,y,u) là nghiệm của (7). Khi đó, (7c) suy ra rằng (5) đúng. Từ Lemma 2, ta thu được kết quả mong muốn.
+
+**Remark 4.** Vì một phương pháp giải dựa trên gradient sẽ được sử dụng, các hàm phạt ngoài (q_i) và (p_j), với (i=1,\ldots,n_g) và (j=1,\ldots,n_h), phải khả vi liên tục để tính các độ nhạy bậc một [62, Sec. 4.2] của (7b). Ví dụ,
+
+[
+q_i(z)=|z|_+^2,\qquad p_j(z)=z^2
+\tag{8}
+]
+
+với mọi (z\in\mathbb{R}), là các lựa chọn hợp lệ. Khi đó, (\Lambda) có thể được viết gọn là
+
+[
+\Lambda(t,x,u)
+==============
+
+\mathbf{1}*{n_g}^{\top}|g(t,x,u)|*+^2
++
+\mathbf{1}_{n_h}^{\top}h(t,x,u)^2
+\tag{9}
+]
+
+với mọi (t\in\mathbb{R}), (x\in\mathbb{R}^{n_x}), và (u\in\mathbb{R}^{n_u}).
+
+**Remark 5.** Các đạo hàm riêng của (\Lambda) được cho bởi
+
+[
+\nabla_{\Box}\Lambda
+====================
+
+\sum_{i=1}^{n_g}\nabla q_i\nabla_{\Box}g_i
++
+\sum_{j=1}^{n_h}\nabla p_j\nabla_{\Box}h_j
+\tag{10}
+]
+
+trong đó (\Box=t,x,u). Một hệ quả của tính khả vi liên tục của (q_i) và (p_j), cùng với cách xây dựng chúng trong (3), là các đạo hàm của chúng trong (10) bằng không tại mọi nơi mà
+
+[
+g_i\le0
+]
+
+và
+
+[
+h_j=0.
+]
+
+**Remark 6.** Hàm phạt (\Lambda) có thể được định nghĩa tổng quát hơn như một hàm giá trị vector có dạng
+
+[
+\Lambda(t,x,u)
+==============
+
+M
+\begin{bmatrix}
+q(g(t,x,u))\
+p(h(t,x,u))
+\end{bmatrix}
+\tag{11}
+]
+
+với mọi (t\in\mathbb{R}_+), (x\in\mathbb{R}^{n_x}), và (u\in\mathbb{R}^{n_u}), trong đó ma trận
+
+[
+M\in\mathbb{R}^{n_y\times(n_g+n_h)},
+]
+
+mà chúng tôi gọi là ma trận trộn, có các phần tử không âm, và các hàm
+
+[
+q:\mathbb{R}^{n_g}\to\mathbb{R}^{n_g},
+\qquad
+p:\mathbb{R}^{n_h}\to\mathbb{R}^{n_h}
+]
+
+được định nghĩa là
+
+[
+q((z_g^1,\ldots,z_g^{n_g}))
+===========================
+
+(q_1(z_g^1),\ldots,q_{n_g}(z_g^{n_g}))
+\tag{12a}
+]
+
+[
+p((z_h^1,\ldots,z_h^{n_h}))
+===========================
+
+(p_1(z_h^1),\ldots,p_{n_h}(z_h^{n_h}))
+\tag{12b}
+]
+
+với mọi (z_g^i\in\mathbb{R}) và (z_h^j\in\mathbb{R}), với (i=1,\ldots,n_g) và (j=1,\ldots,n_h).
+
+Ma trận trộn có nhiều nhất (n_g+n_h) hàng, nhiều nhất một phần tử dương trên mỗi cột, và đúng (n_g+n_h) phần tử dương tổng cộng. Ta thu được (4) và một trạng thái giá trị vô hướng (y) trong (7b) bằng cách chọn
+
+[
+M=\mathbf{1}_{n_g+n_h}^{\top}.
+]
+
+Nói chung, chọn (11) sẽ dẫn đến một trạng thái giá trị vector
+
+[
+y\in\mathbb{R}^{n_y}
+]
+
+để lượng hóa tổng mức vi phạm ràng buộc. Trong khi (4) phù hợp với hầu hết các trường hợp, việc chọn (11) cho một số ứng dụng nhất định có thể đáng tin cậy hơn về mặt số học. Trong phần thảo luận còn lại, chúng tôi dùng định nghĩa trong (4). Tuy nhiên, các kết quả cũng áp dụng cho biểu diễn tổng quát trong (11).
+
+---
+
+## 2.4 Generalized Time-Dilation
+
+## 2.4 Co giãn thời gian tổng quát
+
+Co giãn thời gian là một kỹ thuật biến đổi để đặt một bài toán điều khiển tối ưu có thời gian kết thúc tự do thành một bài toán tương đương có thời gian kết thúc cố định [44, Sec. III.A.1]. Cho (x) là một quỹ đạo trạng thái của (1b) trên ([t_i,t_f]), thu được với đầu vào điều khiển (u) và một điều kiện ban đầu nào đó. Chúng tôi định nghĩa một ánh xạ tăng nghiêm ngặt và khả vi liên tục
+
+[
+t:[0,1]\to\mathbb{R}_+,
+]
+
+với các điều kiện biên
+
+[
+t(0)=t_i,\qquad t(1)=t_f,
+]
+
+và xem đạo hàm của ánh xạ
+
+[
+s(\tau)=\frac{dt(\tau)}{d\tau}=\overset{\circ}{t}(\tau)
+]
+
+với (\tau\in[0,1]), như một đầu vào điều khiển bổ sung, mà chúng tôi gọi là hệ số co giãn. Lưu ý rằng đạo hàm theo (\tau\in[0,1]) được ký hiệu là
+
+[
+\overset{\circ}{\Box}=\frac{d\Box}{d\tau}.
+]
+
+Trước đây, các hệ số co giãn hoặc được xử lý như một biến quyết định tham số đơn, như trong [44, Sec. III.A.1], hoặc như nhiều biến quyết định tham số rời rạc, như trong [63, Sec. 2.1]. Cách tiếp cận được đề xuất ở đây tổng quát hóa điều đó bằng cách xử lý hệ số co giãn như một đầu vào điều khiển trong thời gian liên tục. Chúng tôi lưu ý rằng cách tiếp cận này có sự tương đồng với phép biến đổi time-scaling được đề xuất trong [64,65].
+
+Hơn nữa, chúng tôi xử lý (t) như một trạng thái bổ sung, và định nghĩa các hàm (\tilde u) và (\tilde x) là
+
+[
+\tilde u(\tau)
+==============
+
+(u(t(\tau)),s(\tau))
+\in\mathbb{R}^{n_u+1}
+\tag{13a}
+]
+
+[
+\tilde x(\tau)
+==============
+
+(x(t(\tau)),y(t(\tau)),t(\tau))
+\in\mathbb{R}^{n_x+2}
+\tag{13b}
+]
+
+với (\tau\in[0,1]). Khi đó, dùng quy tắc dây chuyền, ta thu được
+
+[
+\overset{\circ}{\tilde x}(\tau)
+===============================
+
+\begin{bmatrix}
+\dot x(t)\
+\dot y(t)\
+1
+\end{bmatrix}
+\frac{dt(\tau)}{d\tau}
+======================
+
+F(\tilde x(\tau),\tilde u(\tau))
+\tag{14}
+]
+
+với (\tau\in[0,1]), trong đó
+
+[
+F(\tilde x(\tau),\tilde u(\tau))
+================================
+
+\begin{bmatrix}
+f(t(\tau),x(t(\tau)),u(t(\tau)))\
+\Lambda(t(\tau),x(t(\tau)),u(t(\tau)))\
+1
+\end{bmatrix}
+s(\tau).
+\tag{15}
+]
+
+Chúng tôi gọi (14) là hệ mở rộng, với trạng thái mở rộng (\tilde x), và đầu vào điều khiển mở rộng (\tilde u).
+
+Trong phần phát triển tiếp theo, chúng tôi định nghĩa
+
+[
+n_{\tilde x}=n_x+2
+]
+
+và sử dụng các ma trận (x_E), (y_E), và (t_E) để lần lượt chọn (n_x) phần tử đầu tiên, tức (x), phần tử áp chót, tức (y), và phần tử cuối cùng, tức (t), của (\tilde x). Tương tự, các ma trận (u_E) và (s_E) lần lượt chọn (n_u) phần tử đầu tiên, tức (u), và phần tử cuối cùng, tức (s), của (\tilde u).
+
+Lưu ý rằng co giãn thời gian tổng quát biến đổi các hệ động lực không tự trị, tức có phụ thuộc tường minh vào thời gian, thành các hệ tự trị tương đương, tức không phụ thuộc tường minh vào thời gian, bằng cách tăng số chiều của trạng thái và đầu vào điều khiển. Nếu thời gian cuối trong (1) là cố định, thì bước co giãn thời gian tổng quát có thể được bỏ qua. Từ đây trở đi, để ngắn gọn, chúng tôi bỏ từ “tổng quát”.
+
+**Remark 7.** Khi động lực học hệ thống và các hàm ràng buộc trong (1) biến thiên theo thời gian, chúng tôi dùng co giãn thời gian để mở rộng hệ với một trạng thái bổ sung và một đầu vào điều khiển bổ sung. Tuy nhiên, khi mô tả hệ thống và ràng buộc là bất biến theo thời gian, chỉ cần mở rộng đầu vào điều khiển.
+
+---
+
+## 2.5 Reformulated Optimal Control Problem
+
+## 2.5 Bài toán điều khiển tối ưu đã được tái formulation
+
+Áp dụng tái formulation ràng buộc và co giãn thời gian cho (1) dẫn đến bài toán điều khiển tối ưu sau:
+
+[
+\underset{\tilde x,\tilde u}{\text{minimize}}\quad
+\tilde L(\tilde x(1))
+\tag{16a}
+]
+
+subject to
+
+[
+\overset{\circ}{\tilde x}(\tau)
+===============================
+
+F(\tilde x(\tau),\tilde u(\tau))
+\quad \text{a.e. } \tau\in[0,1]
+\tag{16b}
+]
+
+[
+s_E\tilde u(\tau)>0
+\quad \tau\in[0,1]
+\tag{16c}
+]
+
+[
+y_E(\tilde x(1)-\tilde x(0))=0
+\tag{16d}
+]
+
+[
+\tilde P(\tilde x(0),\tilde x(1))\le0
+\tag{16e}
+]
+
+[
+\tilde Q(t_i,\tilde x(0),\tilde x(1))=0
+\tag{16f}
+]
+
+trong đó
+
+[
+\tilde L(\tilde x)
+==================
+
+L(t_E\tilde x,\ x_E\tilde x)
+\tag{17a}
+]
+
+[
+\tilde P(\tilde x,\tilde x')
+============================
+
+P(t_E\tilde x,\ x_E\tilde x,\ t_E\tilde x',\ x_E\tilde x')
+\tag{17b}
+]
+
+[
+\tilde Q(t_i,\tilde x,\tilde x')
+================================
+
+\begin{bmatrix}
+Q(t_i,\ x_E\tilde x,\ t_E\tilde x',\ x_E\tilde x')\
+t_E\tilde x-t_i
+\end{bmatrix}
+\tag{17c}
+]
+
+với mọi
+
+[
+\tilde x,\tilde x'\in\mathbb{R}^{n_{\tilde x}}.
+]
+
+Vì thời gian được xử lý như một biến trạng thái, điều kiện ban đầu của nó cần được chỉ định thông qua (\tilde Q). Điều này không cần thiết trong (1) vì (t_i), vốn là hằng số, được truyền tường minh vào các hàm (P) và (Q). Hơn nữa, tính dương của hệ số co giãn được bảo đảm bằng (16c).
+
+Quan sát rằng, như một hệ quả của tái formulation ràng buộc, các ràng buộc thời gian liên tục trên trạng thái và đầu vào điều khiển không được áp đặt tường minh trong (16); thay vào đó, chúng được nhúng trong hệ mở rộng ở (16b) và điều kiện biên (16d).
+
+---
+
+# 3. Parameterization and Discretization
+
+# 3. Tham số hóa và rời rạc hóa
+
+Mục này mô tả phép biến đổi bài toán điều khiển tối ưu đã được tái formulation, vốn là bài toán vô hạn chiều, trong (11) thành một bài toán tối ưu phi lồi hữu hạn chiều, thông qua tham số hóa đầu vào điều khiển mở rộng và rời rạc hóa (11b) trên khoảng ([0,1]).
+
+Chúng tôi tham số hóa đầu vào điều khiển mở rộng thông qua
+
+[
+\tilde{\nu}:[0,1]\to \mathbb{R}^{n_{\tilde u}},
+]
+
+được định nghĩa là
+
+[
+\tilde{\nu}(\tau)
+=================
+
+\left(
+\Gamma_u(\tau)\otimes
+\begin{bmatrix}
+I_{n_u}\
+0_{1\times n_u}
+\end{bmatrix}
+\right)U
++
+\begin{bmatrix}
+0_{n_u\times N_s}\
+\Gamma_s(\tau)
+\end{bmatrix}S,
+\tag{13}
+]
+
+với (\tau\in[0,1]), và
+
+[
+\Gamma_{\Box}
+=============
+
+\begin{bmatrix}
+\Gamma_{\Box}^{1} & \cdots & \Gamma_{\Box}^{N_{\Box}}
+\end{bmatrix},
+\qquad
+\Box=u,s.
+]
+
+Với mỗi
+
+[
+k=1,\ldots,N_{\Box},
+]
+
+[
+\Gamma_{\Box}^{k}:[0,1]\to\mathbb{R}
+]
+
+là một hàm cơ sở đa thức. Các biến quyết định
+
+[
+U\in\mathbb{R}^{n_uN_u}
+]
+
+và
+
+[
+S\in\mathbb{R}^{N_s}
+]
+
+là các hệ số dùng để tham số hóa đầu vào điều khiển và hệ số co giãn.
+
+Sau khi tham số hóa đầu vào điều khiển mở rộng, chúng tôi rời rạc hóa (11) và (11b) thông qua dạng tích phân của nó trên một lưới hữu hạn kích thước (N) trong ([0,1]), được ký hiệu là
+
+[
+0=\tau_1<\cdots<\tau_N=1.
+]
+
+Chúng tôi cũng xem các trạng thái mở rộng
+
+[
+\tilde{x}_k
+]
+
+tại các điểm nút (\tau_k) là các biến quyết định, và ký hiệu gọn chúng là
+
+[
+\tilde{X}
+=========
+
+(\tilde{x}_1,\ldots,\tilde{x}*N)
+\in
+\mathbb{R}^{n*{\tilde{x}}N}.
+]
+
+Tiếp theo, với mỗi
+
+[
+k=1,\ldots,N-1,
+]
+
+chúng tôi định nghĩa
+
+[
+F_k:
+\mathbb{R}^{n_{\tilde{x}}}
+\times
+\mathbb{R}^{n_{\tilde{x}}}
+\times
+\mathbb{R}^{n_uN_u}
+\times
+\mathbb{R}^{N_s}
+\to
+\mathbb{R}^{n_{\tilde{x}}}
+]
+
+bởi ánh xạ
+
+[
+(\tilde{x}_{k+1},\tilde{x}*k,U,S)
+\mapsto
+\tilde{x}*{k+1}
+---------------
+
+## \tilde{x}_k
+
+\int_{\tau_k}^{\tau_{k+1}}
+F(\tilde{x}^k(\tau),\tilde{\nu}(\tau)),d\tau,
+\tag{14}
+]
+
+trong đó quỹ đạo trạng thái mở rộng
+
+[
+\tilde{x}^k
+]
+
+thỏa (11) và (11b) gần như mọi nơi trên
+
+[
+[\tau_k,\tau_{k+1}]
+]
+
+với đầu vào điều khiển mở rộng (\tilde{\nu}) và điều kiện ban đầu (\tilde{x}_k).
+
+Khi đó, phép rời rạc hóa (11) và (11b), cùng với (11d), cho ra các ràng buộc
+
+[
+F_k(\tilde{x}_{k+1},\tilde{x}_k,U,S)=0,
+\tag{15a}
+]
+
+[
+y^E(\tilde{x}_{k+1}-\tilde{x}_k)=0,
+\tag{15b}
+]
+
+với
+
+[
+k=1,\ldots,N-1.
+]
+
+Phép rời rạc hóa trong (15a), thường được gọi là **multiple shooting**, là chính xác theo nghĩa không có xấp xỉ nào được đưa vào khi chuyển sang biểu diễn tích phân của phương trình vi phân (11) và (11b). Nó cũng ổn định số học hơn so với tiền thân của nó là **single shooting** [66, Sec. VI.A.3].
+
+---
+
+## Definition 5. Continuous-Time Feasibility
+
+## Định nghĩa 5. Tính khả thi trong thời gian liên tục
+
+Bộ ba
+
+[
+\tilde{X},U,S
+]
+
+được gọi là **khả thi trong thời gian liên tục** nếu nó thỏa mãn (15).
+
+Một bộ ba khả thi trong thời gian liên tục
+
+[
+\tilde{X},U,S
+]
+
+tương ứng với một quỹ đạo trạng thái mở rộng được sinh ra bằng cách tích phân (11) và (11b) trên ([0,1]), với đầu vào điều khiển mở rộng (\tilde{\nu}) và điều kiện ban đầu (\tilde{x}_1), sao cho quỹ đạo này đi qua các giá trị nút
+
+[
+\tilde{x}_k
+]
+
+tại (\tau_k), với
+
+[
+k=2,\ldots,N.
+]
+
+Hơn nữa, do (15b), quỹ đạo trạng thái và đầu vào điều khiển thu được thỏa các ràng buộc dọc đường gần như mọi nơi trên
+
+[
+[t_i,t_f].
+]
+
+---
+
+# 3.1. Constraint Qualification and Relaxation
+
+# 3.1. Điều kiện chính quy ràng buộc và phép nới lỏng
+
+Một vấn đề khi áp đặt trực tiếp (15) là nó vi phạm điều kiện chính quy độc lập tuyến tính của ràng buộc, tức **LICQ — linear independence constraint qualification** [67, Def. 12.4].
+
+Với mỗi điểm trong
+
+[
+\mathbb{R}^{n_{\tilde{x}}N}
+\times
+\mathbb{R}^{n_uN_u}
+\times
+\mathbb{R}^{N_s},
+]
+
+ta có thể xác định tập active set [67, Def. 12.1] tương ứng với các ràng buộc trong (15). LICQ được nói là thỏa tại một điểm nếu các gradient của các ràng buộc trong active set tương ứng là độc lập tuyến tính. Kết quả sau đây cho thấy LICQ bị vi phạm tại mọi điểm khả thi đối với (15).
+
+---
+
+## Lemma 6
+
+Nếu
+
+[
+\tilde{X},U,S
+]
+
+khả thi đối với (15a) và (15b), thì với
+
+[
+k=1,\ldots,N-1,
+]
+
+ta có
+
+[
+y^E\nabla_{\tilde{x}*{k+1}}
+F_k(\tilde{x}*{k+1},\tilde{x}_k,U,S)
+====================================
+
+\begin{bmatrix}
+0_{1\times n_x} & 1 & 0
+\end{bmatrix},
+\tag{16a}
+]
+
+[
+y^E\nabla_{\tilde{x}*{k}}
+F_k(\tilde{x}*{k+1},\tilde{x}_k,U,S)
+====================================
+
+\begin{bmatrix}
+0_{1\times n_x} & -1 & 0
+\end{bmatrix},
+\tag{16b}
+]
+
+[
+y^E\nabla_U
+F_k(\tilde{x}_{k+1},\tilde{x}_k,U,S)
+====================================
+
+0_{1\times n_uN_u},
+\tag{16c}
+]
+
+[
+y^E\nabla_S
+F_k(\tilde{x}_{k+1},\tilde{x}_k,U,S)
+====================================
+
+0_{1\times N_s}.
+\tag{16d}
+]
+
+### Proof
+
+Giả sử
+
+[
+\tilde{X},U,S
+]
+
+thỏa (15a) và (15b). Với mỗi
+
+[
+k=1,\ldots,N-1,
+]
+
+gọi (\tilde{x}^k) là quỹ đạo trạng thái mở rộng trên
+
+[
+[\tau_k,\tau_{k+1}]
+]
+
+với đầu vào điều khiển mở rộng (\tilde{\nu}) và điều kiện ban đầu (\tilde{x}_k).
+
+Khi đó, do Lemma 2, các ràng buộc dọc đường (1c) và (1d) được thỏa gần như mọi nơi trên khoảng thời gian
+
+[
+[t^E\tilde{x}*k,\ t^E\tilde{x}*{k+1}].
+]
+
+Nhắc lại rằng (F) được định nghĩa trong (10) là khả vi liên tục, và (\tilde{\nu}) là liên tục từng đoạn. Điều này suy ra rằng
+
+[
+\tau\mapsto
+\nabla_{\tilde{x}}F(\tilde{x}^k(\tau),\tilde{\nu}(\tau)),
+\qquad
+\tau\mapsto
+\nabla_{\tilde{u}}F(\tilde{x}^k(\tau),\tilde{\nu}(\tau)),
+]
+
+là các hàm liên tục từng đoạn. Do đó, chúng khả tích và các đạo hàm riêng của (F_k) là xác định tốt.
+
+Các phần tử của hàng áp chót của
+
+[
+\nabla_{\tilde{x}}F
+]
+
+và
+
+[
+\nabla_{\tilde{u}}F,
+]
+
+tức các đạo hàm riêng của (\Lambda), bằng không gần như mọi nơi trên
+
+[
+[\tau_k,\tau_{k+1}]
+]
+
+khi được đánh giá trên (\tilde{x}^k) và (\tilde{\nu}). Lý do là mọi phần tử của hàng này đều chứa các nhân tử là đạo hàm của (q_i) hoặc (p_j), vốn bằng không do tính liên tục; xem Remark 4. Vì vậy, chỉ các đạo hàm riêng của (F_k) theo (\tilde{x}*k) và (\tilde{x}*{k+1}) mới chứa các phần tử khác không trong hàng đó, như được chỉ ra trong (16a) và (16b). (\blacksquare)
+
+---
+
+Sử dụng Eq. (16), với mọi
+
+[
+\tilde{X},U,S
+]
+
+thỏa (15a) và (15b), gradient của vế trái của (15b), và hàng áp chót của gradient của (F_k), được chỉ ra trong (16), là giống nhau. Vì vậy, mọi nghiệm khả thi của một bài toán tối ưu có cả (15a) và (15b) làm ràng buộc sẽ không thỏa LICQ.
+
+Tuy nhiên, ct-scvx dựa vào **exact penalization**, tức phạt chính xác, của các ràng buộc phi lồi trong (17). Điều này có nghĩa là một điều kiện chính quy ràng buộc như LICQ là cần thiết để liên hệ một cực tiểu cục bộ của (17) với cực tiểu cục bộ của bài toán đã phạt, với một trọng số phạt hữu hạn [68, Thm. 4.4].
+
+Do đó, chúng tôi khắc phục tình huống bệnh lý do (15) gây ra bằng cách nới lỏng (15b) thành một bất đẳng thức với một hằng số dương (\epsilon). Khi đó, (11) và (15b) được biến đổi, dưới tham số hóa đầu vào điều khiển mở rộng (13) và rời rạc hóa (15), thành bài toán sau:
+
+[
+\underset{\tilde{X},U,S}{\text{minimize}}
+\quad
+\tilde{L}(\tilde{x}_N)
+\tag{17a}
+]
+
+subject to
+
+[
+F_k(\tilde{x}_{k+1},\tilde{x}_k,U,S)=0,
+\tag{17b}
+]
+
+[
+y^E(\tilde{x}_{k+1}-\tilde{x}_k)\le \epsilon,
+\tag{17c}
+]
+
+[
+k=1,\ldots,N-1,
+]
+
+[
+U\in\mathcal{U},\qquad S\in\mathcal{S},
+\tag{17d}
+]
+
+[
+\tilde{P}(\tilde{x}_1,\tilde{x}_N)\le0,
+\qquad
+\tilde{Q}(t_i,\tilde{x}_1,\tilde{x}_N)=0,
+\tag{17e}
+]
+
+trong đó
+
+[
+\mathcal{U}\subset\mathbb{R}^{n_uN_u}
+]
+
+và
+
+[
+\mathcal{S}\subset\mathbb{R}^{N_s}
+]
+
+là các tập lồi compact.
+
+Một bước then chốt trong bất kỳ phương pháp giải dựa trên gradient nào cho (17) là tính các đạo hàm riêng của (F_k). Chúng tôi sử dụng phương pháp gọi là **variational method**, tức phương pháp biến phân [63, Sec. 3.2], [62, Sec. 4.2], cũng được gọi là **inverse-free exact discretization**, tức rời rạc hóa chính xác không cần nghịch đảo [64, Sec. 2.3].
+
+---
+
+## Remark 7
+
+Nếu
+
+[
+\tilde{X},U,S
+]
+
+thỏa (17b) và (17c), thì LICQ sẽ không bị vi phạm một cách tầm thường bởi active set gắn với (17c) và hàng áp chót của (17b). Ta suy ra điều này như sau.
+
+Nếu (17c) thỏa với bất đẳng thức nghiêm ngặt cho mọi
+
+[
+k=1,\ldots,N-1,
+]
+
+thì kết quả là hiển nhiên. Tuy nhiên, nếu với một số
+
+[
+k=1,\ldots,N-1,
+]
+
+(17c) thỏa với dấu bằng, thì
+
+[
+\int_{\tau_k}^{\tau_{k+1}}
+s^E\tilde{\nu}(\tau)
+\Lambda
+\left(
+t^E\tilde{x}(\tau),
+x^E\tilde{x}^k(\tau),
+u^E\tilde{\nu}(\tau)
+\right)
+d\tau
+=====
+
+\epsilon,
+\tag{18}
+]
+
+trong đó (\tilde{x}^k) là quỹ đạo trạng thái mở rộng với đầu vào điều khiển mở rộng (\tilde{\nu}) và điều kiện ban đầu (\tilde{x}_k).
+
+Do tính liên tục từng đoạn của integrand trong (18) theo
+
+[
+\tau\in[\tau_k,\tau_{k+1}],
+]
+
+điều này suy ra rằng tồn tại một khoảng
+
+[
+I_k\subset[\tau_k,\tau_{k+1}]
+]
+
+trên đó integrand trong (18) là dương, tức một số ràng buộc dọc đường bị vi phạm trên các đoạn của (\tilde{x}^k) và (\tilde{\nu}) tương ứng với khoảng (I_k). Do đó, khác với trường hợp trong Eq. (16), các đạo hàm riêng của (\Lambda), khi được đánh giá trên các đoạn đó của (\tilde{x}^k) và (\tilde{\nu}), sẽ không còn tầm thường bằng không nữa.
+
+---
+
+## Remark 8
+
+Ngoài việc xử lý vấn đề LICQ, phép nới lỏng (17c) là thiết yếu để cho phép **exact penalization**, tức phạt chính xác. Sự kết hợp của (15a) và (15b) suy ra ràng buộc sau đây cho mỗi
+
+[
+k=1,\ldots,N-1:
+]
+
+[
+y^E
+\left(
+\tilde{x}_{k+1}
+---------------
+
+## \tilde{x}_k
+
+F_k(\tilde{x}_{k+1},\tilde{x}_k,U,S)
+\right)
+=0.
+\tag{19}
+]
+
+Tác dụng của một hàm phạt ngoài không trơn dùng để phạt (19) bị triệt tiêu do tính dương và khả vi liên tục của (\Lambda), do đó phá hỏng tính chính xác của hạng phạt; xem thảo luận trong [67, p. 513]. Vì vậy, phép nới lỏng là rất quan trọng để thu được một điểm KKT của (17) thông qua một điểm dừng của bài toán đã phạt với trọng số phạt hữu hạn.
+
+---
+
+## Remark 9
+
+Tham số hóa (13) cho đầu vào điều khiển mở rộng đủ tổng quát để bao hàm một số tham số hóa đầu vào điều khiển thường dùng trong thực tế, chẳng hạn **zero-order hold**, **first-order hold**, và các đa thức giả phổ, tức **pseudospectral polynomials**, trong collocation trực giao; xem [69, App. B].
+
+Chúng tôi phân biệt giữa tham số hóa cho đầu vào điều khiển và tham số hóa cho hệ số co giãn vì đầu vào điều khiển có thể được biểu diễn bằng một đa thức từng đoạn miễn là (U) bị chặn theo từng phần tử thông qua tập (\mathcal{U}), trong khi hệ số co giãn phải bị chặn và dương do (11c), thông qua tập (\mathcal{S}).
+
+Bất cứ khi nào lựa chọn tham số hóa cho phép, ví dụ với zero-order hold hoặc first-order hold, các ràng buộc điều khiển lồi trong (1c) và (1d) có thể được mã hóa bằng (\mathcal{U}), tức các ràng buộc chỉ được áp tại các điểm nút nhưng vẫn bảo đảm thỏa ràng buộc giữa các mẫu.
+
+Hơn nữa, yêu cầu đầu vào điều khiển mở rộng thuộc một tập compact thông qua (17d) là cần thiết để suy ra một chặn trên mức vi phạm ràng buộc theo điểm, xét đến phép nới lỏng (\epsilon) trong (17c).
+
+---
+
+# 3.2. Pointwise Constraint Violation Bound
+
+# 3.2. Chặn vi phạm ràng buộc theo điểm
+
+Cho (\epsilon>0) và một nghiệm của (17), ta có thể xây dựng một quỹ đạo trạng thái (x), một đầu vào điều khiển (u), và một lưới kích thước (N), được cho bởi
+
+[
+t_i=t_1<\cdots<t_N=t_f.
+]
+
+Với mỗi
+
+[
+k=1,\ldots,N,
+]
+
+thời điểm tương ứng với (\tau_k) là (t_k). Với mỗi
+
+[
+k=1,\ldots,N-1,
+]
+
+độ dài của khoảng
+
+[
+[t_k,t_{k+1}]
+]
+
+là (\Delta t_k), với một chặn dưới (\Delta t_{\min}).
+
+Tiếp theo, với mỗi
+
+[
+i=1,\ldots,n_g,
+\qquad
+j=1,\ldots,n_h,
+\qquad
+k=1,\ldots,N-1,
+]
+
+định nghĩa
+
+[
+\hat{g}_i^k(\epsilon)
+=====================
+
+\operatorname*{ess,sup}*{t\in[t_k,t*{k+1}]}
+|g_i(t,x(t),u(t))|_+,
+\tag{20a}
+]
+
+[
+\hat{h}_j^k(\epsilon)
+=====================
+
+\operatorname*{ess,sup}*{t\in[t_k,t*{k+1}]}
+|h_j(t,x(t),u(t))|.
+\tag{20b}
+]
+
+Các đại lượng này lượng hóa mức vi phạm đo được lớn nhất của các ràng buộc dọc đường trên
+
+[
+[t_k,t_{k+1}].
+]
+
+Với lựa chọn các hàm phạt ngoài trong (7), ta có thể thiết lập một chặn trên cho
+
+[
+\hat{g}_i^k(\epsilon)
+]
+
+và
+
+[
+\hat{h}_j^k(\epsilon)
+]
+
+như sau. Các hàm phạt ngoài khả vi liên tục khác cũng có thể được xử lý theo cách tương tự.
+
+---
+
+## Theorem 10
+
+Với mỗi
+
+[
+i=1,\ldots,n_g,
+\qquad
+j=1,\ldots,n_h,
+]
+
+cho (q_i) và (p_j) là các hàm phạt ngoài bậc hai trong (7). Khi đó, tồn tại
+
+[
+\omega_{g_i}
+]
+
+và
+
+[
+\omega_{h_j}
+]
+
+sao cho
+
+[
+\epsilon
+\le
+\omega_{\Box}^{2}
+\frac{\Delta t_{\min}^{3}}{4}
+\quad
+\Longrightarrow
+\quad
+\hat{\Box}^{k}(\epsilon)
+\le
+\delta_{\Box}(\epsilon)
+=======================
+
+(4\epsilon\omega_{\Box})^{\frac{1}{3}},
+\tag{21}
+]
+
+với mỗi
+
+[
+k=1,\ldots,N-1,
+]
+
+trong đó
+
+[
+\Box=g_i,h_j.
+]
+
+### Proof
+
+Xem Appendix. (\blacksquare)
+
+Chặn trong (21) là nhất quán vì
+
+[
+\delta_{\Box}(\epsilon)
+]
+
+là đơn điệu nghiêm ngặt với
+
+[
+\epsilon\in\mathbb{R}_+
+]
+
+và
+
+[
+\delta_{\Box}(\epsilon)\to0
+\quad\text{khi}\quad
+\epsilon\to0.
+]
+
+Điều này bảo đảm rằng
+
+[
+\hat{\Box}^{k}(\epsilon)
+]
+
+là liên tục phải tại (\epsilon=0), trong đó
+
+[
+\Box=g_i,h_j.
+]
+
+---
+
+## Remark 11
+
+Chặn theo điểm cho các ràng buộc dọc đường dạng bất đẳng thức xác định lượng **constraint tightening**, tức lượng siết chặt ràng buộc, cần thiết để các nghiệm thu được với phép nới lỏng (17c) thỏa các ràng buộc mà không có vi phạm theo điểm. Cụ thể,
+
+[
+\int_{t_k}^{t_{k+1}}
+|g_i(t,x(t),u(t))+\delta_{g_i}(\epsilon)|_+^2,dt
+\le
+\epsilon
+]
+
+suy ra
+
+[
+g_i(t,x(t),u(t))\le0
+\quad
+\text{a.e. } t\in[t_k,t_{k+1}].
+]
+

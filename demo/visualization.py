@@ -11,6 +11,7 @@ Provides:
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+import matplotlib.gridspec as gridspec
 from matplotlib.collections import PatchCollection, LineCollection
 from matplotlib.animation import FuncAnimation, PillowWriter
 from matplotlib.colors import to_rgba
@@ -32,8 +33,95 @@ def setup_plot_style():
         'legend.fontsize': 10,
         'figure.dpi': 150,
         'savefig.dpi': 150,
-        'savefig.bbox': 'tight'
+        'savefig.bbox': 'tight',
+        'axes.facecolor': '#fbfbfb',
+        'figure.facecolor': 'white',
+        'axes.edgecolor': '#333333',
+        'axes.grid': False,
     })
+
+
+def _status_color(success: bool) -> str:
+    """Consistent status color."""
+    return '#2E7D32' if success else '#B71C1C'
+
+
+def _compact_float(value: float) -> str:
+    """Human-friendly numeric formatting for figure panels."""
+    if not np.isfinite(value):
+        return 'N/A'
+    abs_value = abs(float(value))
+    if abs_value != 0.0 and (abs_value < 1e-3 or abs_value >= 1e4):
+        return f"{value:.2e}"
+    return f"{value:.4g}"
+
+
+def _result_total_duration(result: OptimizationResult) -> float:
+    """Total physical trajectory duration."""
+    return float(sum(result.time_durations.values()))
+
+
+def _collect_profile_data(result: OptimizationResult) -> Tuple[np.ndarray, np.ndarray]:
+    """Collect speed samples from trajectory chords for plotting."""
+    times = []
+    velocities = []
+    cumulative_t = 0.0
+
+    for traj, tau, delta in result.trajectories:
+        for i in range(len(traj) - 1):
+            dt = (tau[i + 1] - tau[i]) * delta
+            if dt > 1e-10:
+                pos_diff = traj[i + 1, :2] - traj[i, :2]
+                vel = np.linalg.norm(pos_diff) / dt
+                times.append(cumulative_t + tau[i] * delta)
+                velocities.append(vel)
+        cumulative_t += delta
+
+    return np.asarray(times, dtype=np.float64), np.asarray(velocities, dtype=np.float64)
+
+
+def _draw_text_panel(ax, title: str, lines: List[str],
+                     accent_color: str = '#263238',
+                     fontsize: float = 8.5) -> None:
+    """Draw a clean text panel with a small accent bar."""
+    ax.axis('off')
+    ax.add_patch(
+        patches.FancyBboxPatch(
+            (0.0, 0.0), 1.0, 1.0,
+            boxstyle='round,pad=0.015,rounding_size=0.02',
+            transform=ax.transAxes,
+            facecolor='white',
+            edgecolor='#dddddd',
+            linewidth=1.0,
+            zorder=0,
+        )
+    )
+    ax.add_patch(
+        patches.Rectangle(
+            (0.0, 0.0), 0.018, 1.0,
+            transform=ax.transAxes,
+            facecolor=accent_color,
+            edgecolor='none',
+            zorder=1,
+        )
+    )
+    ax.text(
+        0.055, 0.94, title,
+        transform=ax.transAxes,
+        fontsize=10,
+        fontweight='bold',
+        color='#212121',
+        va='top',
+    )
+    ax.text(
+        0.055, 0.86, '\n'.join(lines),
+        transform=ax.transAxes,
+        fontfamily='monospace',
+        fontsize=fontsize,
+        color='#263238',
+        va='top',
+        linespacing=1.28,
+    )
 
 
 def _polygon_vertices(polygon_like) -> np.ndarray:
@@ -52,7 +140,8 @@ def plot_environment(ax, workspace_bounds: Tuple[float, float, float, float],
                      obstacles: Optional[List[object]] = None,
                      highlight_regions: Optional[List[int]] = None,
                      show_labels: bool = True,
-                     alpha: float = 0.3):
+                     alpha: float = 0.22,
+                     max_labeled_regions: int = 45):
     """
     Plot the planning environment with convex regions.
     
@@ -72,42 +161,50 @@ def plot_environment(ax, workspace_bounds: Tuple[float, float, float, float],
     # Plot workspace boundary
     workspace_rect = patches.Rectangle(
         (x_min, y_min), x_max - x_min, y_max - y_min,
-        linewidth=2, edgecolor='black', facecolor='#f5f5f5'
+        linewidth=1.8, edgecolor='#202020', facecolor='#f7f8fa', zorder=0
     )
     ax.add_patch(workspace_rect)
     
-    # Colormap for regions
-    cmap = plt.cm.get_cmap('tab10')
+    # Colormap for regions. Keep non-path regions quiet so the path reads first.
+    cmap = plt.cm.get_cmap('tab20')
+    highlight_set = set(highlight_regions or [])
+    show_region_labels = bool(show_labels and len(regions) <= max_labeled_regions)
     
     # Plot regions
     for region in regions:
-        color = cmap(region.index % 10)
+        color = cmap(region.index % 20)
         
         # Determine if highlighted
-        if highlight_regions is not None and region.index in highlight_regions:
-            face_alpha = 0.5
-            edge_width = 2.5
-            edge_color = 'darkblue'
+        if region.index in highlight_set:
+            face_alpha = 0.45
+            edge_width = 2.0
+            edge_color = '#1565C0'
+            zorder = 2
         else:
             face_alpha = alpha
-            edge_width = 1.0
-            edge_color = color
+            edge_width = 0.8
+            edge_color = '#b8c0c8'
+            zorder = 1
         
         poly = patches.Polygon(
             region.vertices,
             closed=True,
             facecolor=(*color[:3], face_alpha),
             edgecolor=edge_color,
-            linewidth=edge_width
+            linewidth=edge_width,
+            zorder=zorder,
         )
         ax.add_patch(poly)
 
         # Label
-        if show_labels:
+        if show_region_labels or region.index in highlight_set:
             centroid = region.get_centroid()
             ax.text(centroid[0], centroid[1], f'R{region.index}',
-                   ha='center', va='center', fontsize=8,
-                   fontweight='bold' if highlight_regions and region.index in highlight_regions else 'normal')
+                   ha='center', va='center',
+                   fontsize=8 if len(regions) <= max_labeled_regions else 7,
+                   color='#0D47A1' if region.index in highlight_set else '#455A64',
+                   fontweight='bold' if region.index in highlight_set else 'normal',
+                   zorder=5)
 
     # Overlay obstacles explicitly so blocked space is easy to see.
     for obstacle_idx, obstacle in enumerate(obstacles or []):
@@ -115,9 +212,8 @@ def plot_environment(ax, workspace_bounds: Tuple[float, float, float, float],
             _polygon_vertices(obstacle),
             closed=True,
             facecolor='#404040',
-            edgecolor='#f5f5f5',
-            linewidth=1.2,
-            hatch='///',
+            edgecolor='#ffffff',
+            linewidth=1.0,
             alpha=0.95,
             zorder=4,
             label='Obstacle' if obstacle_idx == 0 else None,
@@ -125,16 +221,20 @@ def plot_environment(ax, workspace_bounds: Tuple[float, float, float, float],
         ax.add_patch(obstacle_patch)
 
     # Plot start and goal
-    ax.plot(start_pos[0], start_pos[1], 'go', markersize=15, 
-            label='Start', zorder=10, markeredgecolor='darkgreen', markeredgewidth=2)
-    ax.plot(goal_pos[0], goal_pos[1], 'r^', markersize=15,
-            label='Goal', zorder=10, markeredgecolor='darkred', markeredgewidth=2)
+    ax.scatter(start_pos[0], start_pos[1], s=150, marker='o',
+               facecolor='#2E7D32', edgecolor='white', linewidth=1.8,
+               label='Start', zorder=10)
+    ax.scatter(goal_pos[0], goal_pos[1], s=170, marker='*',
+               facecolor='#C62828', edgecolor='white', linewidth=1.2,
+               label='Goal', zorder=10)
     
     ax.set_xlim(x_min - 0.2, x_max + 0.2)
     ax.set_ylim(y_min - 0.2, y_max + 0.2)
     ax.set_aspect('equal')
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc='upper right')
+    ax.grid(True, color='#d7dce0', linewidth=0.6, alpha=0.75)
+    ax.tick_params(colors='#37474F')
+    ax.legend(loc='upper right', frameon=True, framealpha=0.92,
+              facecolor='white', edgecolor='#dddddd')
 
 
 def _collect_mesh_points(result: OptimizationResult,
@@ -209,31 +309,37 @@ def plot_trajectory(ax, result: OptimizationResult, regions: List[ConvexRegion],
         all_times.append(times)
         cumulative_time += delta
     
-    # Plot trajectory segments with color gradient
+    # Plot trajectory segments. A subtle path shadow helps on dense maze maps.
     for i, (positions, times) in enumerate(zip(all_positions, all_times)):
-        # Main trajectory line
+        ax.plot(positions[:, 0], positions[:, 1],
+                color='white', linewidth=linewidth + 2.8,
+                solid_capstyle='round', zorder=5, alpha=0.95)
         ax.plot(positions[:, 0], positions[:, 1],
                 color=trajectory_color, linewidth=linewidth,
-                solid_capstyle='round', zorder=5)
+                solid_capstyle='round', zorder=6,
+                label='Trajectory' if i == 0 else None)
         
-        # Heading arrows (sample a few points)
-        if show_heading and i == 0:  # Only first segment start
+        if show_heading:
             traj = result.trajectories[i][0]
-            pos = traj[0, :2]
-            theta = traj[0, 2]
-            
-            arrow_len = 0.15
-            dx = arrow_len * np.cos(theta)
-            dy = arrow_len * np.sin(theta)
-            ax.arrow(pos[0], pos[1], dx, dy, head_width=0.08,
-                    head_length=0.04, fc='green', ec='darkgreen', zorder=6)
+            sample_count = min(3, len(traj))
+            if sample_count > 0:
+                indices = np.linspace(0, len(traj) - 1, sample_count, dtype=int)
+                for idx in np.unique(indices):
+                    pos = traj[idx, :2]
+                    theta = traj[idx, 2]
+                    arrow_len = 0.12
+                    dx = arrow_len * np.cos(theta)
+                    dy = arrow_len * np.sin(theta)
+                    ax.arrow(pos[0], pos[1], dx, dy, head_width=0.055,
+                            head_length=0.04, fc='#0D47A1', ec='#0D47A1',
+                            alpha=0.72, zorder=7, length_includes_head=True)
     
     # Interface points
     if show_interface_points and result.interface_points:
         interface_pts = np.array(result.interface_points)
         ax.scatter(interface_pts[:, 0], interface_pts[:, 1],
-                  c='#FF9800', s=100, marker='D', zorder=7,
-                  edgecolors='darkorange', linewidths=1.5,
+                  c='#F57C00', s=76, marker='D', zorder=8,
+                  edgecolors='white', linewidths=1.2,
                   label='Interface Points')
     
     # Mesh points (sample from trajectories)
@@ -241,8 +347,9 @@ def plot_trajectory(ax, result: OptimizationResult, regions: List[ConvexRegion],
         mesh_pts, _ = _collect_mesh_points(result)
         if len(mesh_pts) > 0:
             ax.scatter(mesh_pts[:, 0], mesh_pts[:, 1],
-                      c='#9C27B0', s=30, marker='o', zorder=6,
-                      alpha=0.6, label='Mesh Points')
+                      c='#7B1FA2', s=24, marker='o', zorder=7,
+                      alpha=0.72, edgecolors='white', linewidths=0.35,
+                      label='Mesh Points')
 
 
 def plot_graph_structure(ax, graph: RegionGraph, 
@@ -322,28 +429,60 @@ def create_result_figure(result: OptimizationResult, graph: RegionGraph,
     """
     setup_plot_style()
     
-    fig = plt.figure(figsize=figsize)
+    fig = plt.figure(figsize=figsize, constrained_layout=True)
+    grid = gridspec.GridSpec(
+        3, 3,
+        figure=fig,
+        width_ratios=[1.25, 1.25, 1.0],
+        height_ratios=[1.0, 0.9, 0.95],
+    )
     
     # Main plot: environment + trajectory
-    ax_main = fig.add_subplot(2, 2, (1, 3))
+    ax_main = fig.add_subplot(grid[:, :2])
     
     # Plot environment
     plot_environment(ax_main, workspace_bounds, graph.regions,
                      start_pos, goal_pos,
                      obstacles=obstacles,
-                     highlight_regions=result.path_regions if result.path_regions else None)
+                     highlight_regions=result.path_regions if result.path_regions else None,
+                     show_labels=len(graph.regions) <= 80)
     
     # Plot trajectory
     if result.trajectories:
         plot_trajectory(ax_main, result, graph.regions)
+        violating_points = []
+        violating_labels = []
+        for region_idx, diagnostic in result.safety_diagnostics.items():
+            if diagnostic.get('max_violation', -np.inf) > 0.0 and diagnostic.get('worst_point') is not None:
+                violating_points.append(diagnostic['worst_point'])
+                violating_labels.append(
+                    f"R{region_idx}: {diagnostic.get('max_violation', 0.0):.2e}"
+                )
+        if violating_points:
+            pts = np.asarray(violating_points, dtype=np.float64)
+            ax_main.scatter(
+                pts[:, 0], pts[:, 1],
+                c='#D50000', s=90, marker='x', linewidths=2.2,
+                zorder=12, label='Worst dense violation'
+            )
+            for point, label in zip(pts[:8], violating_labels[:8]):
+                ax_main.text(
+                    point[0], point[1], label,
+                    fontsize=7.5, color='#B71C1C',
+                    ha='left', va='bottom', zorder=13,
+                    bbox=dict(facecolor='white', edgecolor='#ffcdd2', alpha=0.85, pad=1.5),
+                )
     
-    ax_main.set_title(f"{title}\n{'Success' if result.success else 'Failed'}")
+    status = 'SUCCESS' if result.success else 'FAILED'
+    ax_main.set_title(f"{title}\n{status}", color=_status_color(result.success),
+                      fontweight='bold')
     ax_main.set_xlabel("x [m]")
     ax_main.set_ylabel("y [m]")
+    ax_main.legend(loc='upper right', frameon=True, framealpha=0.92,
+                   facecolor='white', edgecolor='#dddddd')
     
     # Info panel
-    ax_info = fig.add_subplot(2, 2, 2)
-    ax_info.axis('off')
+    ax_info = fig.add_subplot(grid[0, 2])
 
     path_labels = []
     for node_id in result.path:
@@ -356,14 +495,16 @@ def create_result_figure(result: OptimizationResult, graph: RegionGraph,
         path_labels.append(node_id)
 
     path_text = ' -> '.join(path_labels) if path_labels else 'N/A'
-    path_lines = textwrap.wrap(path_text, width=30, break_long_words=False) or ['N/A']
+    path_lines = textwrap.wrap(path_text, width=34, break_long_words=False) or ['N/A']
+    total_time = _result_total_duration(result)
 
     info_text = [
-        "Optimization",
         f"Status  {'OK' if result.success else 'FAIL'}",
-        f"Cost    {result.total_cost:.4f}",
+        f"Cost    {_compact_float(result.total_cost)}",
         f"Solve   {result.solve_time:.3f} s",
+        f"Dur     {total_time:.3f} s",
         f"Paths   {result.n_paths_evaluated}",
+        f"Regions {len(result.path_regions)}/{len(graph.regions)}",
         f"Defect  {result.defect_norm:.2e}",
         f"Gap     {result.max_connection_gap:.2e}",
         f"CtrlGap {result.max_control_jump:.2e}",
@@ -373,62 +514,52 @@ def create_result_figure(result: OptimizationResult, graph: RegionGraph,
     if result.max_integrality_gap > 0.0:
         info_text.append(f"IntGap  {result.max_integrality_gap:.2e}")
 
-    info_text.extend([
-        "",
-        "Path",
-        *path_lines,
-    ])
+    _draw_text_panel(ax_info, "Optimization", info_text, _status_color(result.success))
 
+    ax_safety = fig.add_subplot(grid[1, 2])
+    safety_lines = [
+        f"Mode    {result.safety_mode}",
+        f"CTCS    {result.max_continuous_violation_integral:.2e}",
+        f"Dense   {result.max_dense_region_violation:.2e}",
+    ]
+    if result.continuous_violation_integrals:
+        top_ctcs = sorted(
+            result.continuous_violation_integrals.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )[:4]
+        safety_lines.append("")
+        safety_lines.append("Top eta")
+        safety_lines.extend([f"R{idx:<4} {value:.2e}" for idx, value in top_ctcs])
+    _draw_text_panel(ax_safety, "Safety Diagnostics", safety_lines, '#6A1B9A')
+
+    ax_path = fig.add_subplot(grid[2, 2])
+    path_panel_lines = ["Path", *path_lines]
     if result.solver_status:
-        info_text.extend([
+        path_panel_lines.extend([
             "",
             "Solver",
-            *textwrap.wrap(result.solver_status, width=30, break_long_words=False),
+            *textwrap.wrap(result.solver_status, width=34, break_long_words=False),
         ])
+    _draw_text_panel(ax_path, "Route", path_panel_lines, '#1565C0', fontsize=7.8)
 
-    if result.success:
-        total_time = sum(result.time_durations.values())
-        info_text.extend([
-            "",
-            f"Duration {total_time:.3f} s",
-        ])
-
-    ax_info.text(0.05, 0.95, '\n'.join(info_text),
-                transform=ax_info.transAxes,
-                fontfamily='monospace', fontsize=8.5,
-                verticalalignment='top')
+    # Inset trajectory profile on top of the main map area.
+    ax_profile = ax_main.inset_axes([0.04, 0.04, 0.38, 0.20])
     
-    # Trajectory profile
-    ax_profile = fig.add_subplot(2, 2, 4)
-    
-    if result.success and result.trajectories:
-        # Plot velocity profile
-        times = []
-        velocities = []
-        cumulative_t = 0.0
-        
-        for traj, tau, delta in result.trajectories:
-            for i in range(len(traj) - 1):
-                dt = (tau[i+1] - tau[i]) * delta
-                if dt > 1e-10:
-                    pos_diff = traj[i+1, :2] - traj[i, :2]
-                    vel = np.linalg.norm(pos_diff) / dt
-                    times.append(cumulative_t + tau[i] * delta)
-                    velocities.append(vel)
-            cumulative_t += delta
-        
-        ax_profile.plot(times, velocities, 'b-', linewidth=1.5, label='|v|')
+    if result.trajectories:
+        times, velocities = _collect_profile_data(result)
+        ax_profile.plot(times, velocities, color='#1565C0', linewidth=1.5, label='speed')
         ax_profile.set_xlabel("Time [s]")
-        ax_profile.set_ylabel("Velocity [m/s]")
-        ax_profile.set_title("Velocity Profile")
-        ax_profile.grid(True, alpha=0.3)
-        ax_profile.legend()
+        ax_profile.set_ylabel("Speed")
+        ax_profile.set_title("Speed profile", fontsize=9)
+        ax_profile.grid(True, color='#d7dce0', linewidth=0.5, alpha=0.7)
+        ax_profile.tick_params(labelsize=8)
+        ax_profile.set_facecolor((1, 1, 1, 0.92))
     else:
         ax_profile.text(0.5, 0.5, "No trajectory data",
                        ha='center', va='center', transform=ax_profile.transAxes)
-        ax_profile.set_title("Velocity Profile")
+        ax_profile.set_title("Speed profile")
     
-    plt.tight_layout()
     return fig
 
 
@@ -460,13 +591,20 @@ def create_animation(result: OptimizationResult, graph: RegionGraph,
     
     setup_plot_style()
     
-    fig, ax = plt.subplots(figsize=(10, 10))
+    fig, (ax, ax_info) = plt.subplots(
+        1, 2,
+        figsize=(12.5, 9.5),
+        gridspec_kw={'width_ratios': [4.6, 1.25]},
+        constrained_layout=True,
+    )
+    ax_info.axis('off')
     
     # Static background
     plot_environment(ax, workspace_bounds, graph.regions,
                      start_pos, goal_pos,
                      obstacles=obstacles,
-                     highlight_regions=result.path_regions)
+                     highlight_regions=result.path_regions,
+                     show_labels=len(graph.regions) <= 60)
     
     # Collect trajectory points with time
     all_points = []
@@ -489,17 +627,91 @@ def create_animation(result: OptimizationResult, graph: RegionGraph,
     # Total trajectory time
     total_time = all_times[-1]
     n_frames = max(2, int(fps * duration))
+    status_color = _status_color(result.success)
+    status_text = 'OK' if result.success else 'FAIL'
     
     # Animation elements
-    robot_marker, = ax.plot([], [], 'bo', markersize=12, zorder=10)
-    trail_line, = ax.plot([], [], 'b-', linewidth=2, alpha=0.7, zorder=5)
+    full_line, = ax.plot(all_points[:, 0], all_points[:, 1],
+                         color='#90CAF9', linewidth=2.0, alpha=0.8,
+                         zorder=5, label='Planned path')
+    robot_marker, = ax.plot([], [], 'o', markersize=11, zorder=12,
+                            color='#0D47A1', markeredgecolor='white',
+                            markeredgewidth=1.5)
+    trail_line, = ax.plot([], [], color='#0D47A1', linewidth=3.0,
+                          alpha=0.95, zorder=8, solid_capstyle='round',
+                          label='Executed trail')
     mesh_scatter = ax.scatter([], [], c='#9C27B0', s=35, marker='o',
-                              zorder=6, alpha=0.75, label='Mesh Points')
+                              zorder=7, alpha=0.75, edgecolors='white',
+                              linewidths=0.35, label='Reached mesh')
     heading_arrow = ax.annotate('', xy=(0, 0), xytext=(0, 0),
-                                arrowprops=dict(arrowstyle='->', color='blue', lw=2))
-    time_text = ax.text(0.02, 0.98, '', transform=ax.transAxes,
-                       fontsize=12, verticalalignment='top',
-                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+                                arrowprops=dict(arrowstyle='->', color='#0D47A1', lw=2.2))
+    panel_bg = patches.FancyBboxPatch(
+        (0.02, 0.02), 0.96, 0.96,
+        boxstyle='round,pad=0.02,rounding_size=0.02',
+        transform=ax_info.transAxes,
+        facecolor='white',
+        edgecolor='#d7dce0',
+        linewidth=1.0,
+    )
+    ax_info.add_patch(panel_bg)
+    status_badge = ax_info.text(
+        0.50, 0.94,
+        f"{status_text}",
+        transform=ax_info.transAxes,
+        fontsize=12,
+        ha='center',
+        va='top',
+        color='white',
+        fontweight='bold',
+        bbox=dict(boxstyle='round,pad=0.35', facecolor=status_color,
+                  edgecolor='none', alpha=0.96),
+    )
+    time_text = ax_info.text(
+        0.08, 0.84, '', transform=ax_info.transAxes,
+        fontsize=10.0, verticalalignment='top',
+        fontfamily='monospace',
+        color='#263238',
+    )
+    legend_text = ax_info.text(
+        0.08, 0.43,
+        "Legend\n"
+        "blue  executed trail\n"
+        "pale  planned path\n"
+        "dot   robot\n"
+        "purple reached mesh\n"
+        "star  goal",
+        transform=ax_info.transAxes,
+        fontsize=9.0,
+        fontfamily='monospace',
+        color='#37474F',
+        va='top',
+    )
+    progress_bg = patches.Rectangle(
+        (0.08, 0.26), 0.84, 0.024,
+        transform=ax_info.transAxes,
+        facecolor='#E0E0E0',
+        edgecolor='none',
+    )
+    progress_fg = patches.Rectangle(
+        (0.08, 0.26), 0.0, 0.024,
+        transform=ax_info.transAxes,
+        facecolor='#1565C0',
+        edgecolor='none',
+    )
+    ax_info.add_patch(progress_bg)
+    ax_info.add_patch(progress_fg)
+    ax_info.text(
+        0.08, 0.30, "Progress",
+        transform=ax_info.transAxes,
+        fontsize=9,
+        fontweight='bold',
+        color='#263238',
+    )
+    ax.set_title(
+        f"GCS-MMS trajectory replay | total {total_time:.2f} s",
+        color='#263238',
+        fontweight='bold',
+    )
     
     def init():
         robot_marker.set_data([], [])
@@ -508,7 +720,11 @@ def create_animation(result: OptimizationResult, graph: RegionGraph,
         heading_arrow.set_position((0, 0))
         heading_arrow.xy = (0, 0)
         time_text.set_text('')
-        return robot_marker, trail_line, mesh_scatter, heading_arrow, time_text
+        progress_fg.set_width(0.0)
+        return (
+            full_line, robot_marker, trail_line, mesh_scatter,
+            heading_arrow, time_text, status_badge, legend_text, progress_fg
+        )
     
     def animate(frame):
         # Current animation time (mapped to trajectory time)
@@ -532,7 +748,8 @@ def create_animation(result: OptimizationResult, graph: RegionGraph,
         
         # Update trail (all points up to current)
         trail_idx = idx + 1
-        trail_line.set_data(all_points[:trail_idx, 0], all_points[:trail_idx, 1])
+        trail_positions = np.vstack([all_points[:trail_idx], pos])
+        trail_line.set_data(trail_positions[:, 0], trail_positions[:, 1])
 
         # Show mesh points that have been reached so far
         if show_mesh_points and len(mesh_points) > 0:
@@ -549,12 +766,25 @@ def create_animation(result: OptimizationResult, graph: RegionGraph,
         heading_arrow.xy = (pos[0] + dx, pos[1] + dy)
         
         # Update time text
-        time_text.set_text(f't = {t_traj:.2f} s')
+        progress = t_traj / max(total_time, 1e-12)
+        progress_fg.set_width(0.84 * np.clip(progress, 0.0, 1.0))
+        time_text.set_text(
+            f"mode   {result.safety_mode}\n"
+            f"time   {t_traj:6.2f} / {total_time:.2f}s\n"
+            f"cost   {_compact_float(result.total_cost)}\n"
+            f"CTCS   {result.max_continuous_violation_integral:.2e}\n"
+            f"Dense  {result.max_dense_region_violation:.2e}\n"
+            f"Defect {result.defect_norm:.2e}\n"
+            f"Gap    {result.max_connection_gap:.2e}"
+        )
         
-        return robot_marker, trail_line, mesh_scatter, heading_arrow, time_text
+        return (
+            full_line, robot_marker, trail_line, mesh_scatter,
+            heading_arrow, time_text, status_badge, legend_text, progress_fg
+        )
     
     anim = FuncAnimation(fig, animate, init_func=init,
-                        frames=n_frames, interval=1000/fps, blit=True)
+                        frames=n_frames, interval=1000/fps, blit=False)
     
     # Save as GIF
     writer = PillowWriter(fps=fps)
@@ -579,12 +809,30 @@ def save_result_summary(result: OptimizationResult, filename: str):
         'total_cost': float(result.total_cost),
         'solve_time': float(result.solve_time),
         'n_paths_evaluated': result.n_paths_evaluated,
+        'pipeline_mode': result.pipeline_mode,
+        'candidate_paths_ranked': result.candidate_paths_ranked,
+        'n_paths_screened': result.n_paths_screened,
+        'n_paths_polished': result.n_paths_polished,
+        'early_stopped': result.early_stopped,
+        'repair_attempted': result.repair_attempted,
+        'repaired_regions': result.repaired_regions,
+        'per_candidate_diagnostics': result.per_candidate_diagnostics,
+        'stage_timings': result.stage_timings,
         'path': result.path,
         'path_regions': result.path_regions,
         'defect_norm': float(result.defect_norm),
         'max_connection_gap': float(result.max_connection_gap),
         'max_integrality_gap': float(result.max_integrality_gap),
         'constraint_violation': float(result.constraint_violation),
+        'safety_mode': result.safety_mode,
+        'continuous_violation_integrals': {
+            str(k): float(v) for k, v in result.continuous_violation_integrals.items()
+        },
+        'max_ctcs_integral': float(result.max_continuous_violation_integral),
+        'max_dense_region_violation': float(result.max_dense_region_violation),
+        'safety_diagnostics': result.safety_diagnostics,
+        'transition_diagnostics': result.transition_diagnostics,
+        'failure_reasons': result.failure_reasons,
         'time_durations': {str(k): float(v) for k, v in result.time_durations.items()},
         'interface_points': [pt.tolist() for pt in result.interface_points],
     }

@@ -77,15 +77,17 @@ endif()
 # -----------------------------------------------------------------------------
 # 4. TARGET 1: Ứng dụng GUI (acd2d_gui) - Giống hệt Makefile cũ
 # -----------------------------------------------------------------------------
-# Tìm các thư viện đồ họa (OpenGL, GLUT, X11)
-find_package(OpenGL REQUIRED)
-find_package(GLUT REQUIRED)
+# Tìm các thư viện đồ họa (OpenGL, GLUT, X11) - chỉ cần cho GUI
+find_package(OpenGL QUIET)
+find_package(GLUT QUIET)
 
 if(UNIX AND NOT APPLE)
-    find_package(X11 REQUIRED)
+    find_package(X11 QUIET)
 endif()
 
-add_executable(acd2d_gui ${CORE_SRCS} ${GUI_SRCS})
+# GUI target (nếu tìm thấy OpenGL/GLUT)
+if(OPENGL_FOUND AND GLUT_FOUND)
+    add_executable(acd2d_gui ${CORE_SRCS} ${GUI_SRCS})
 
 # Include paths
 target_include_directories(acd2d_gui PRIVATE ${ACD2D_INCLUDE_DIRS})
@@ -108,6 +110,9 @@ else()
     
     # QUAN TRỌNG: Thêm cờ -no-pie để sửa lỗi linker với libFIST cũ
     target_link_options(acd2d_gui PRIVATE -no-pie)
+endif()
+else()
+    message(STATUS "OpenGL/GLUT not found; skipping acd2d_gui target")
 endif()
 
 # -----------------------------------------------------------------------------
@@ -145,16 +150,24 @@ set_target_properties(acd2d_cli PROPERTIES OUTPUT_NAME acd2d)
 # -----------------------------------------------------------------------------
 # 6. Installation (Optional)
 # -----------------------------------------------------------------------------
-install(TARGETS acd2d_gui acd2d_cli
-    RUNTIME DESTINATION bin
-)
+if(OPENGL_FOUND AND GLUT_FOUND)
+    install(TARGETS acd2d_gui acd2d_cli
+        RUNTIME DESTINATION bin
+    )
+else()
+    install(TARGETS acd2d_cli
+        RUNTIME DESTINATION bin
+    )
+endif()
 
 # -----------------------------------------------------------------------------
 # 7. Build information
 # -----------------------------------------------------------------------------
 message(STATUS "=== ACD2D Build Configuration ===")
 message(STATUS "Build targets:")
-message(STATUS "  - acd2d_gui (GUI application)")
+if(OPENGL_FOUND AND GLUT_FOUND)
+    message(STATUS "  - acd2d_gui (GUI application)")
+endif()
 message(STATUS "  - acd2d_cli (Command-line tool, output: acd2d)")
 message(STATUS "FIST library: ${FIST_AVAILABLE}")
 if(FIST_AVAILABLE)
