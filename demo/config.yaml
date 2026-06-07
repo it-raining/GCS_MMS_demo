@@ -121,11 +121,17 @@ optimizer:
     tol: 1.0e-6
     print_level: 0  # 0=silent, 5=verbose
     
-  # Big-M values for on/off constraints
+  # Solver mode
+  # "integrated_relaxation_legacy" : one-phase Big-M MIOCP relaxation (IPOPT)
+  # "two_stage"                    : heuristic path selection + fixed-path NLP
+  # "centroid_refine_dms"          : Chebyshev-center graph search + interface QP + barrier DMS
+  solver_mode: "integrated_relaxation_legacy"
+
+  # Big-M values for on/off constraints (used only by integrated_relaxation_legacy)
   big_M:
     position: 20.0    # for state bounds
     interface: 20.0   # for coupling constraints
-    time: 100.0       # for time variable bounds
+    time: 100.0       # UNUSED: declared for backward compat; no constraint builder reads it
 
 # -----------------------------------------------------------------------------
 # Visualization Configuration
@@ -202,11 +208,15 @@ scenarios:
 output:
   # Directory for results (relative to demo folder)
   results_dir: "results"
-  
+
+  # Directory for Markdown reports (relative to repo root)
+  docs_dir: "docs"
+
   # File formats
   save_png: true
   save_gif: true
   save_json: true  # save numeric results
-  
+  save_md: true    # save Markdown reports to docs/
+
   # Verbosity level (0=quiet, 1=normal, 2=verbose)
   verbosity: 1

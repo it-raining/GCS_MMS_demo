@@ -321,3 +321,74 @@ def visualize_graph_structure(graph: RegionGraph, filename: Optional[str] = None
         plt.close()
     else:
         plt.show()
+
+
+def chebyshev_center(A: np.ndarray, b: np.ndarray) -> "Tuple[np.ndarray, float]":
+    """Compute Chebyshev center and radius of {q | Aq <= b} via LP."""
+    from scipy.optimize import linprog
+    n = A.shape[1]
+    norms = np.linalg.norm(A, axis=1, keepdims=True)
+    c_obj = np.zeros(n + 1)
+    c_obj[-1] = -1.0
+    A_ub = np.hstack([A, norms])
+    bounds = [(None, None)] * n + [(0.0, None)]
+    res = linprog(c_obj, A_ub=A_ub, b_ub=b, bounds=bounds, method='highs')
+    if not res.success or res.x is None:
+        raise ValueError(f"Chebyshev LP failed: {res.message}")
+    return res.x[:n].copy(), float(res.x[n])
+
+
+def add_composite_costs_to_graph(
+    graph: RegionGraph,
+    start_pos: np.ndarray,
+    goal_pos: np.ndarray,
+    gamma_w: float = 1.0,
+    gamma_h: float = 0.64,
+) -> "Dict[int, Tuple[np.ndarray, float]]":
+    """
+    Annotate graph edges with 'composite_cost' = centroid_dist - gamma_w*interface_radius.
+    Returns dict mapping region_index -> (chebyshev_center, chebyshev_radius).
+    """
+    centers: Dict[int, "Tuple[np.ndarray, float]"] = {}
+    for region in graph.regions:
+        c, r = chebyshev_center(region.A, region.b)
+        centers[region.index] = (c, r)
+
+    interface_radii: Dict["Tuple[str, str]", float] = {}
+    for edge in graph.region_edges:
+        u_id, v_id = edge
+        ri = region_index_from_node_id(u_id)
+        rj = region_index_from_node_id(v_id)
+        A_int = np.vstack([graph.regions[ri].A, graph.regions[rj].A])
+        b_int = np.concatenate([graph.regions[ri].b, graph.regions[rj].b])
+        try:
+            _, rho_ij = chebyshev_center(A_int, b_int)
+        except ValueError:
+            rho_ij = 0.0
+        interface_radii[edge] = rho_ij
+
+    for u, v, data in graph.graph.edges(data=True):
+        if u == SOURCE:
+            p1 = start_pos.astype(float)
+        else:
+            p1 = centers[region_index_from_node_id(u)][0]
+        if v == TARGET:
+            p2 = goal_pos.astype(float)
+        else:
+            p2 = centers[region_index_from_node_id(v)][0]
+        dist = float(np.linalg.norm(p2 - p1))
+        rho_interface = interface_radii.get((u, v), 0.0)
+        cost = dist - gamma_w * rho_interface
+        data['composite_cost'] = max(cost, 1e-9)
+
+    return centers
+
+
+def k_shortest_paths_generator(
+    graph: RegionGraph,
+    source: str,
+    target: str,
+    weight: str = 'composite_cost',
+):
+    """Generator yielding simple paths source->target in non-decreasing composite cost (Yen's)."""
+    return nx.shortest_simple_paths(graph.graph, source, target, weight=weight)

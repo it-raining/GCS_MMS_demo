@@ -99,5 +99,50 @@ class DynamicsTests(unittest.TestCase):
         np.testing.assert_allclose(u1, w[2:])
 
 
+class LipschitzBoundTests(unittest.TestCase):
+    def test_unicycle_lipschitz_bound(self) -> None:
+        dynamics = UnicycleModel(v_max=2.0)
+        A = np.array([[1, 0], [-1, 0], [0, 1], [0, -1]], dtype=float)
+        L_s = dynamics.compute_lipschitz_bound([A])
+        self.assertAlmostEqual(L_s, 2.0)
+
+    def test_unicycle_lipschitz_scaled_normal(self) -> None:
+        dynamics = UnicycleModel(v_max=3.0)
+        A = np.array([[2.0, 0.0]], dtype=float)
+        L_s = dynamics.compute_lipschitz_bound([A])
+        self.assertAlmostEqual(L_s, 6.0)
+
+    def test_double_integrator_properties(self) -> None:
+        from dynamics import DoubleIntegratorDynamics
+        dyn = DoubleIntegratorDynamics(v_max=2.0, a_max=3.0)
+        self.assertEqual(dyn.n_x, 4)
+        self.assertEqual(dyn.n_u, 2)
+        self.assertEqual(dyn.n_pos, 2)
+        self.assertEqual(dyn.position_indices, (0, 1))
+        self.assertEqual(dyn.angle_indices, ())
+
+    def test_double_integrator_dynamics(self) -> None:
+        from dynamics import DoubleIntegratorDynamics
+        dyn = DoubleIntegratorDynamics()
+        x = np.array([1.0, 2.0, 0.5, -0.3])
+        u = np.array([0.1, 0.2])
+        xdot = dyn.f(x, u)
+        np.testing.assert_allclose(xdot, [0.5, -0.3, 0.1, 0.2])
+
+    def test_double_integrator_state_bounds(self) -> None:
+        from dynamics import DoubleIntegratorDynamics
+        dyn = DoubleIntegratorDynamics(v_max=2.0)
+        lb, ub = dyn.state_bounds(np.array([0.0, 0.0]), np.array([5.0, 5.0]))
+        self.assertEqual(len(lb), 4)
+        self.assertAlmostEqual(lb[2], -2.0)
+        self.assertAlmostEqual(ub[2],  2.0)
+
+    def test_double_integrator_lipschitz(self) -> None:
+        from dynamics import DoubleIntegratorDynamics
+        dyn = DoubleIntegratorDynamics(v_max=2.0)
+        A = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=float)
+        self.assertAlmostEqual(dyn.compute_lipschitz_bound([A]), 2.0)
+
+
 if __name__ == "__main__":
     unittest.main()

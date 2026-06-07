@@ -15,8 +15,9 @@ Classification: MIOCP -> MINLP after transcription
 Solvers: CasADi + IPOPT
 """
 
+import math
 import numpy as np
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Union
 from dataclasses import dataclass, field
 import casadi as ca
 import time
@@ -70,17 +71,25 @@ class OptimizationConfig:
     delta_min: float = 0.1
     delta_max: float = 10.0
     
-    # Big-M values
+    # Big-M values (used only in the integrated legacy relaxation)
     M_position: float = 20.0
     M_interface: float = 20.0
+    # M_time is declared for config backward compatibility but is NOT
+    # referenced in any constraint builder.  It has no effect on the NLP.
     M_time: float = 100.0
     enforce_control_continuity: bool = True
-    
+
     # IPOPT options
     max_iter: int = 3000
     tol: float = 1e-6
     print_level: int = 0
     max_polish_path_candidates: int = 3
+
+    # Solver mode
+    # "integrated_relaxation_legacy" : one-phase Big-M MIOCP relaxation (IPOPT)
+    # "two_stage"                    : heuristic path selection + fixed-path NLP
+    # "fixed_path_only"              : PathNLPSolver only (requires explicit path)
+    solver_mode: str = "integrated_relaxation_legacy"
     
 @dataclass
 class OptimizationResult:
@@ -112,6 +121,26 @@ class OptimizationResult:
     max_connection_gap: float = 0.0
     max_control_jump: float = 0.0
     max_integrality_gap: float = 0.0
+
+    # Extended diagnostics (set by solver; NaN when not available)
+    min_safety_margin: float = float("nan")
+    total_duration: float = float("nan")
+    path_length_metric: float = float("nan")
+
+    # Formulation metadata
+    # global_optimality_claim: always "No global certificate" for IPOPT-based solvers.
+    global_optimality_claim: str = "No global certificate; local NLP solution only."
+    # formulation_mode: identifies which solver/Big-M strategy produced this result.
+    formulation_mode: str = ""
+
+    # Centroid-Refine-DMS specific fields
+    certified_safety_margin: float = float("nan")
+    lipschitz_gap: float = float("nan")
+    safety_certification: str = "NOT_SET"
+    lb_geometric: float = 0.0
+    optimality_gap: float = float("inf")
+    n_barrier_levels: int = 0
+    failure_log: list = field(default_factory=list)
 
 
 def _compute_connection_gap(path_regions: List[int],
@@ -702,6 +731,8 @@ class PathNLPSolver:
             result.control_params,
             self.control_param
         )
+        if result.time_durations:
+            result.total_duration = float(sum(result.time_durations.values()))
 
         return result
 
@@ -1063,8 +1094,15 @@ class IntegratedMIOCPSolver:
             )
 
         result.solve_time = time.time() - start_time
+        if not result.formulation_mode:
+            result.formulation_mode = "LEGACY_INTEGRATED_BIGM_RELAXATION_IPOPT"
+        result.global_optimality_claim = (
+            "No global certificate; IPOPT continuous relaxation of MIOCP."
+        )
+        if math.isnan(result.total_duration) and result.time_durations:
+            result.total_duration = float(sum(result.time_durations.values()))
         return result
-    
+
     def _build_and_solve_integrated_miocp(self, start_state: np.ndarray,
                                           goal_state: np.ndarray,
                                           verbose: bool) -> OptimizationResult:
@@ -1481,17 +1519,418 @@ class IntegratedMIOCPSolver:
         
         return result
 
-def create_integrated_optimizer_from_config(graph: RegionGraph,
-                                            dynamics: DynamicsModel,
-                                            config_dict: Dict) -> IntegratedMIOCPSolver:
+class TwoStageGCSDMSSolver:
     """
-    Create the one-phase integrated MIOCP optimizer from configuration.
+    Two-stage path-first DMS solver — no Big-M MIOCP relaxation.
+
+    Stage 1 (path selection):
+        Enumerate candidate region paths using a centroid-distance graph
+        heuristic (``networkx.shortest_simple_paths``). This is NOT a
+        certified GCS convex relaxation; it is a geometric scoring heuristic.
+        No MIOCP relaxation variables, no Big-M activation/containment/coupling.
+
+    Stage 2 (trajectory optimization):
+        For each candidate path, solve a fixed-path nonlinear DMS NLP with
+        IPOPT via ``PathNLPSolver``. Only the active path regions have decision
+        variables. Geometry, coupling, and boundary constraints are applied
+        directly — no Big-M needed because inactive regions have no variables.
+
+    Problem class:
+        Continuous nonconvex NLP (one per candidate path).
+        IPOPT returns a local solution; no global optimality certificate.
+
+    Formulation mode string: ``TWO_STAGE_HEURISTIC_PATH_SELECTION_FIXED_PATH_NLP``
+
+    Big-M summary:
+        - Region activation:  NONE (inactive regions have no variables)
+        - Region containment: direct inequality A q ≤ b
+        - Interface equality: direct equality s⁺[i] = s⁻[i+1]
+        - DMS defect:         no Big-M, applied directly
+        - Control continuity: direct equality or disabled
+
+    NOTE: Removing Big-M from the geometry/coupling layer does NOT make the
+    problem convex. The DMS defect s⁺ = F_endpoint(s⁻, w, Δ) is nonlinear for
+    unicycle dynamics and remains nonconvex regardless of the path strategy.
+    """
+
+    def __init__(self, graph: RegionGraph, dynamics: DynamicsModel,
+                 config: OptimizationConfig):
+        self.graph = graph
+        self.dynamics = dynamics
+        self.config = config
+
+        self.control_param = ControlParameterization(
+            n_u=dynamics.n_u,
+            parameterization="piecewise_constant",
+            n_segments=config.n_control_segments,
+        )
+        self.integration_bundle = create_integration_bundle(
+            dynamics,
+            self.control_param,
+            config.n_integration_steps,
+            config.n_mesh_points,
+        )
+        self.path_solver = PathNLPSolver(
+            graph,
+            dynamics,
+            config,
+            control_param=self.control_param,
+            integration_bundle=self.integration_bundle,
+        )
+
+    def _iter_candidate_paths(self, start_state: np.ndarray,
+                              goal_state: np.ndarray,
+                              max_candidates: int) -> List[List[str]]:
+        """Centroid-distance ranked simple paths (heuristic, not GCS relaxation)."""
+        import networkx as nx
+        from graph_builder import SOURCE, TARGET
+
+        def edge_weight(u: str, v: str, _attrs: Dict) -> float:
+            if u == SOURCE:
+                p1 = start_state[:2]
+            else:
+                p1 = self.graph.get_region_by_id(u).get_centroid()
+            if v == TARGET:
+                p2 = goal_state[:2]
+            else:
+                p2 = self.graph.get_region_by_id(v).get_centroid()
+            return float(np.linalg.norm(p2 - p1))
+
+        candidates: List[List[str]] = []
+        try:
+            for path in nx.shortest_simple_paths(
+                self.graph.graph, SOURCE, TARGET, weight=edge_weight
+            ):
+                candidates.append(path)
+                if len(candidates) >= max_candidates:
+                    break
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            pass
+        return candidates
+
+    def solve(self, start_state: np.ndarray, goal_state: np.ndarray,
+              verbose: bool = False) -> OptimizationResult:
+        """
+        Two-stage solve: heuristic path enumeration + fixed-path NLP polish.
+
+        No Big-M constraints, no MIOCP relaxation variables.
+        Returns the lowest-cost feasible result across all candidate paths.
+        """
+        start_time = time.time()
+        max_candidates = max(1, self.config.max_polish_path_candidates)
+        candidates = self._iter_candidate_paths(start_state, goal_state, max_candidates)
+
+        _mode = "TWO_STAGE_HEURISTIC_PATH_SELECTION_FIXED_PATH_NLP"
+        _claim = "No global certificate; local NLP solution only."
+
+        if not candidates:
+            return OptimizationResult(
+                success=False,
+                path=[],
+                path_regions=[],
+                total_cost=np.inf,
+                solve_time=time.time() - start_time,
+                n_paths_evaluated=0,
+                solver_status="TWO_STAGE: no path found in region graph",
+                formulation_mode=_mode,
+                global_optimality_claim=_claim,
+            )
+
+        if verbose:
+            print(f"Two-stage solver: {len(candidates)} candidate path(s)")
+            print("Solver backend: IPOPT fixed-path NLP (no Big-M)")
+
+        best_result: Optional[OptimizationResult] = None
+        last_result: Optional[OptimizationResult] = None
+        n_evaluated = 0
+
+        for candidate_path in candidates:
+            n_evaluated += 1
+            result = self.path_solver.solve_path(candidate_path, start_state, goal_state)
+            last_result = result
+            if verbose:
+                status = "OK" if result.success else "FAIL"
+                print(f"  Path {n_evaluated}: {' -> '.join(candidate_path)} [{status}]")
+            if result.success:
+                if best_result is None or result.total_cost < best_result.total_cost:
+                    best_result = result
+
+        chosen = best_result if best_result is not None else last_result
+        assert chosen is not None  # candidates list was non-empty
+
+        chosen.n_paths_evaluated = n_evaluated
+        chosen.solve_time = time.time() - start_time
+        chosen.formulation_mode = _mode
+        chosen.global_optimality_claim = _claim
+        if best_result is None:
+            chosen.success = False
+            chosen.solver_status = (
+                f"TWO_STAGE: all {n_evaluated} candidate(s) failed: "
+                f"{chosen.solver_status}"
+            )
+        else:
+            chosen.solver_status = f"TWO_STAGE: {chosen.solver_status}"
+        if math.isnan(chosen.total_duration) and chosen.time_durations:
+            chosen.total_duration = float(sum(chosen.time_durations.values()))
+        return chosen
+
+
+@dataclass
+class CentroidRefineDMSConfig:
+    """Configuration for CentroidRefineDMSSolver."""
+    gamma_w: float = 1.0
+    gamma_h: float = 0.64
+    alpha_s: float = 0.0
+    delta_safe: float = 0.02
+    delta_extra: float = 0.01
+    v_nom_fraction: float = 0.5
+    alpha_mu: float = 0.1
+    tau: float = 0.1
+    mu_min: float = 1e-5
+    n_int: int = 20
+    delta_min: float = 0.01
+    delta_max: float = 10.0
+    w_T: float = 1.0
+    w_L: float = 1.0
+    w_U: float = 1.0
+    w_S: float = 0.2
+    epsilon_final: float = 1e-6
+    epsilon_gap: float = 0.05
+    time_limit_s: float = 60.0
+    mode: str = "first_feasible"
+    use_centroid_cost: bool = True
+    use_interface_qp: bool = True
+    use_log_barrier: bool = True
+    use_barrier_continuation: bool = True
+    use_inexact_tolerance: bool = True
+
+
+class CentroidRefineDMSSolver:
+    """
+    Centroid-Refine-DMS: first-feasible motion planner.
+    Stages: K-shortest paths → interface QP → warm-start IVP → barrier-continuation DMS.
+    """
+
+    MANDATORY_DISCLAIMER = (
+        "LB is a geometric lower bound on time component only. "
+        "No global optimality claim. "
+        "The solution is a KKT point of the barrier-augmented NLP under LICQ+SOSC."
+    )
+
+    def __init__(self, graph: RegionGraph, dynamics: DynamicsModel,
+                 config: CentroidRefineDMSConfig):
+        self.graph = graph
+        self.dynamics = dynamics
+        self.config = config
+
+    def solve(self, x_start: np.ndarray, x_goal: np.ndarray) -> OptimizationResult:
+        import time as _time
+        from graph_builder import (
+            add_composite_costs_to_graph, k_shortest_paths_generator, SOURCE, TARGET
+        )
+        from graph_types import region_index_from_node_id, is_terminal_node_id
+        from geometric_refiner import (
+            InterfaceQPConfig, NarrowInterfaceError, InterfaceQPInfeasible,
+            solve_interface_refinement,
+        )
+        from warmstart import WarmStartConfig, generate_warm_start_ivp
+        from barrier_dms import (
+            BarrierDMSSolver, BarrierDMSSolverConfig, FailureCode,
+        )
+
+        cfg = self.config
+        t0 = _time.time()
+
+        if cfg.use_centroid_cost:
+            add_composite_costs_to_graph(
+                self.graph, x_start[:2], x_goal[:2], cfg.gamma_w, cfg.gamma_h)
+            weight = 'composite_cost'
+        else:
+            weight = None
+
+        lb_geom = self._geometric_lb(x_start, x_goal)
+
+        qp_cfg = InterfaceQPConfig(
+            delta_safe=cfg.delta_safe, delta_extra=cfg.delta_extra, lambda_s=cfg.alpha_s)
+        ws_cfg = WarmStartConfig(
+            delta_min=cfg.delta_min, delta_max=cfg.delta_max,
+            v_nom_fraction=cfg.v_nom_fraction, n_int=cfg.n_int)
+        barrier_cfg = BarrierDMSSolverConfig(
+            n_int=cfg.n_int, delta_safe=cfg.delta_safe,
+            delta_min=cfg.delta_min, delta_max=cfg.delta_max,
+            w_T=cfg.w_T, w_L=cfg.w_L, w_U=cfg.w_U, w_S=cfg.w_S,
+            alpha_mu=cfg.alpha_mu, tau=cfg.tau, mu_min=cfg.mu_min,
+            epsilon_final=cfg.epsilon_final)
+        barrier_solver = BarrierDMSSolver(self.dynamics, barrier_cfg)
+
+        tried: set = set()
+        UB = float("inf")
+        best: Optional[OptimizationResult] = None
+        all_failures: list = []
+        n_eval = 0
+
+        try:
+            path_gen = k_shortest_paths_generator(self.graph, SOURCE, TARGET, weight=weight)
+        except Exception:
+            return self._empty_result(lb_geom, 0, _time.time() - t0, all_failures)
+
+        while True:
+            if _time.time() - t0 > cfg.time_limit_s:
+                break
+            try:
+                path = next(path_gen)
+            except StopIteration:
+                break
+            key = tuple(path)
+            if key in tried:
+                continue
+            tried.add(key)
+            n_eval += 1
+
+            path_regions = [region_index_from_node_id(n) for n in path
+                            if not is_terminal_node_id(n)]
+            if not path_regions:
+                continue
+
+            pos_idx = list(self.dynamics.position_indices)
+            q_start = x_start[pos_idx]
+            q_goal  = x_goal[pos_idx]
+
+            if cfg.use_interface_qp:
+                try:
+                    z = solve_interface_refinement(
+                        self.graph, path_regions, q_start, q_goal, qp_cfg)
+                except (NarrowInterfaceError, InterfaceQPInfeasible) as e:
+                    all_failures.append({'path': list(path),
+                                         'code': FailureCode.NARROW_INTERFACE, 'detail': str(e)})
+                    continue
+            else:
+                z = self._naive_z(path_regions, q_start, q_goal)
+
+            try:
+                ws = generate_warm_start_ivp(z, path_regions, self.dynamics, ws_cfg)
+            except Exception as e:
+                all_failures.append({'path': list(path),
+                                     'code': FailureCode.WARM_START_VIOLATION, 'detail': str(e)})
+                continue
+
+            br = barrier_solver.solve_path(self.graph, path_regions, x_start, x_goal, ws)
+
+            if br.success:
+                if br.cost_unbarred < UB:
+                    UB = br.cost_unbarred
+                    best = self._build_result(br, path, path_regions, lb_geom, UB,
+                                              n_eval, all_failures, _time.time() - t0)
+                if cfg.mode == "first_feasible":
+                    break
+                gap = (UB - lb_geom * cfg.w_T) / max(1.0, abs(UB))
+                if gap <= cfg.epsilon_gap or _time.time() - t0 > cfg.time_limit_s:
+                    break
+            else:
+                for fr in br.failure_log:
+                    all_failures.append({'path': list(path), 'code': fr.code,
+                                         'barrier_level': fr.barrier_level})
+
+        if best is None:
+            return self._empty_result(lb_geom, n_eval, _time.time() - t0, all_failures)
+        best.n_paths_evaluated = n_eval
+        best.solve_time = _time.time() - t0
+        return best
+
+    def _geometric_lb(self, x_start, x_goal) -> float:
+        from graph_builder import SOURCE, TARGET
+        from graph_types import region_index_from_node_id
+        import networkx as nx
+        pos_idx = list(self.dynamics.position_indices)
+        u_lb, u_ub = self.dynamics.control_bounds()
+        v_max = max(float(u_ub[0]) if u_ub.size else 1.0, 1e-6)
+
+        def _w(u, v, _d):
+            if u == SOURCE:
+                p1 = self._graph_pos(u, x_start, pos_idx)
+            else:
+                p1 = self._graph_pos(u, x_start, pos_idx)
+            p2 = self._graph_pos(v, x_goal, pos_idx)
+            return float(np.linalg.norm(p2 - p1))
+
+        try:
+            return nx.shortest_path_length(self.graph.graph, SOURCE, TARGET, weight=_w) / v_max
+        except Exception:
+            return 0.0
+
+    def _graph_pos(self, node, x_ref, pos_idx):
+        from graph_builder import SOURCE, TARGET
+        from graph_types import region_index_from_node_id, is_terminal_node_id
+        if is_terminal_node_id(node):
+            return x_ref[pos_idx]
+        ri = region_index_from_node_id(node)
+        return np.mean(self.graph.regions[ri].vertices, axis=0)
+
+    def _naive_z(self, path_regions, q_start, q_goal):
+        m = len(path_regions)
+        z = np.zeros((m + 2, 2))
+        z[0] = q_start; z[m + 1] = q_goal
+        for i in range(m):
+            z[i + 1] = np.mean(self.graph.regions[path_regions[i]].vertices, axis=0)
+        return z
+
+    def _build_result(self, br, path, path_regions, lb_geom, UB,
+                      n_eval, failures, elapsed) -> OptimizationResult:
+        gap = (UB - lb_geom * self.config.w_T) / max(1.0, abs(UB))
+        safety_cert = ("CERTIFIED_CONTINUOUS_SAFE"
+                       if np.isfinite(br.s_min_certified) and br.s_min_certified > 0
+                       else "SAMPLED_SAFE_ONLY")
+        result = OptimizationResult(
+            success=True, path=list(path), path_regions=path_regions,
+            total_cost=UB, solve_time=elapsed, n_paths_evaluated=n_eval,
+            solver_status="CRD: KKT solution",
+            defect_norm=br.defect_norm, min_safety_margin=br.s_min_sampled,
+            certified_safety_margin=br.s_min_certified, lipschitz_gap=br.lipschitz_gap,
+            safety_certification=safety_cert, lb_geometric=lb_geom,
+            optimality_gap=gap, n_barrier_levels=br.n_barrier_levels_run,
+            global_optimality_claim=self.MANDATORY_DISCLAIMER,
+            formulation_mode="CENTROID_REFINE_DMS", failure_log=failures,
+            max_connection_gap=br.coupling_gap,
+        )
+        if br.x_nodes_opt is not None:
+            for seg_i, ridx in enumerate(path_regions):
+                result.entry_states[ridx] = br.x_nodes_opt[seg_i][0]
+                result.exit_states[ridx]  = br.x_nodes_opt[seg_i][-1]
+                result.control_params[ridx] = br.u_list_opt[seg_i]
+                result.time_durations[ridx] = br.delta_opt[seg_i]
+        if result.time_durations:
+            result.total_duration = float(sum(result.time_durations.values()))
+        return result
+
+    def _empty_result(self, lb_geom, n_eval, elapsed, failures) -> OptimizationResult:
+        return OptimizationResult(
+            success=False, path=[], path_regions=[],
+            total_cost=float("inf"), solve_time=elapsed, n_paths_evaluated=n_eval,
+            solver_status="CRD: no feasible path found",
+            global_optimality_claim=self.MANDATORY_DISCLAIMER,
+            lb_geometric=lb_geom, failure_log=failures,
+        )
+
+
+def create_integrated_optimizer_from_config(
+    graph: RegionGraph,
+    dynamics: DynamicsModel,
+    config_dict: Dict,
+) -> Union[IntegratedMIOCPSolver, TwoStageGCSDMSSolver]:
+    """
+    Build an optimizer from the runtime config dict.
+
+    Reads ``optimizer.solver_mode`` to decide which solver class to return:
+    - ``"integrated_relaxation_legacy"`` (default): Big-M MIOCP relaxation
+    - ``"two_stage"``: centroid-heuristic path selection + fixed-path NLP
     """
     cost_config = config_dict.get('cost', {})
     shooting_config = config_dict.get('shooting', {})
     optimizer_config = config_dict.get('optimizer', {})
     control_config = config_dict.get('control', {})
-    
+
+    solver_mode = optimizer_config.get('solver_mode', 'integrated_relaxation_legacy')
+
     opt_config = OptimizationConfig(
         a=cost_config.get('a', 1.0),
         w_L=cost_config.get('w_L', 1.0),
@@ -1514,6 +1953,40 @@ def create_integrated_optimizer_from_config(graph: RegionGraph,
         tol=optimizer_config.get('ipopt', {}).get('tol', 1e-6),
         print_level=optimizer_config.get('ipopt', {}).get('print_level', 0),
         max_polish_path_candidates=optimizer_config.get('path_polish_candidates', 3),
+        solver_mode=solver_mode,
     )
-    
+
+    if solver_mode == "centroid_refine_dms":
+        crd_dict = config_dict.get('centroid_refine_dms', {})
+        crd_config = CentroidRefineDMSConfig(
+            gamma_w=float(crd_dict.get('gamma_w', 1.0)),
+            gamma_h=float(crd_dict.get('gamma_h', 0.64)),
+            alpha_s=float(crd_dict.get('alpha_s', 0.0)),
+            delta_safe=float(crd_dict.get('delta_safe', 0.02)),
+            delta_extra=float(crd_dict.get('delta_extra', 0.01)),
+            v_nom_fraction=float(crd_dict.get('v_nom_fraction', 0.5)),
+            alpha_mu=float(crd_dict.get('alpha_mu', 0.1)),
+            tau=float(crd_dict.get('tau', 0.1)),
+            mu_min=float(crd_dict.get('mu_min', 1e-5)),
+            n_int=int(crd_dict.get('n_int', 20)),
+            delta_min=float(crd_dict.get('delta_min', 0.01)),
+            delta_max=float(crd_dict.get('delta_max', 10.0)),
+            w_T=float(crd_dict.get('w_T', 1.0)),
+            w_L=float(crd_dict.get('w_L', 1.0)),
+            w_U=float(crd_dict.get('w_U', 1.0)),
+            w_S=float(crd_dict.get('w_S', 0.2)),
+            epsilon_final=float(crd_dict.get('epsilon_final', 1e-6)),
+            epsilon_gap=float(crd_dict.get('epsilon_gap', 0.05)),
+            time_limit_s=float(crd_dict.get('time_limit_s', 60.0)),
+            mode=str(crd_dict.get('mode', 'first_feasible')),
+            use_centroid_cost=bool(crd_dict.get('use_centroid_cost', True)),
+            use_interface_qp=bool(crd_dict.get('use_interface_qp', True)),
+            use_log_barrier=bool(crd_dict.get('use_log_barrier', True)),
+            use_barrier_continuation=bool(crd_dict.get('use_barrier_continuation', True)),
+            use_inexact_tolerance=bool(crd_dict.get('use_inexact_tolerance', True)),
+        )
+        return CentroidRefineDMSSolver(graph, dynamics, crd_config)
+
+    if solver_mode == "two_stage":
+        return TwoStageGCSDMSSolver(graph, dynamics, opt_config)
     return IntegratedMIOCPSolver(graph, dynamics, opt_config)
