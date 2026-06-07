@@ -98,6 +98,7 @@ class ExperimentRunner:
     def __init__(self, config_path: str = "config.yaml"):
         self.config = DemoConfig(config_path)
         self.output_dir = self.config.output_dir
+        self.docs_dir = self.config.docs_dir
         os.makedirs(self.output_dir, exist_ok=True)
 
     def run_scenario(self, scenario_name: str, verbose: bool = True) -> Tuple[ExperimentResult, PreparedScenario]:
@@ -162,11 +163,13 @@ class ExperimentRunner:
                      results: Dict[str, Tuple[ExperimentResult, PreparedScenario]],
                      save_png: bool | None = None,
                      save_gif: bool | None = None,
-                     save_json: bool | None = None) -> None:
-        """Persist figures, animations, summaries, and a benchmark table."""
+                     save_json: bool | None = None,
+                     save_md: bool | None = None) -> None:
+        """Persist figures, animations, summaries, Markdown reports, and a benchmark table."""
         save_png = self.config.save_png if save_png is None else save_png
         save_gif = self.config.save_gif if save_gif is None else save_gif
         save_json = self.config.save_json if save_json is None else save_json
+        save_md = self.config.save_md if save_md is None else save_md
 
         for scenario_name, (exp_result, prepared) in results.items():
             from visualization import create_animation, create_result_figure, save_result_summary
@@ -213,7 +216,14 @@ class ExperimentRunner:
             if save_json:
                 save_result_summary(opt_result, f"{prefix}_summary.json")
 
+            if save_md:
+                from reporting import write_markdown_report
+                write_markdown_report(exp_result, prepared, self.docs_dir)
+
         self._save_benchmark_summary(results)
+        if save_md:
+            from reporting import write_benchmark_markdown
+            write_benchmark_markdown(results, self.docs_dir)
 
     def _save_benchmark_summary(self, results: Dict[str, Tuple[ExperimentResult, PreparedScenario]]) -> None:
         """Save a compact benchmark JSON and print a console table."""

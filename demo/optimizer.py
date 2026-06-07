@@ -15,6 +15,7 @@ Classification: MIOCP -> MINLP after transcription
 Solvers: CasADi + IPOPT
 """
 
+import math
 import numpy as np
 from typing import List, Dict, Tuple, Optional, Callable
 from dataclasses import dataclass, field, replace
@@ -91,12 +92,14 @@ class OptimizationConfig:
     active_delta_min: float = 0.05
     delta_max: float = 10.0
     
-    # Big-M values
+    # Big-M values (used only in the integrated legacy relaxation)
     M_position: float = 20.0
     M_interface: float = 20.0
+    # M_time is declared for config backward compatibility but is NOT
+    # referenced in any constraint builder.  It has no effect on the NLP.
     M_time: float = 100.0
     enforce_control_continuity: bool = True
-    
+
     # IPOPT options
     max_iter: int = 3000
     tol: float = 1e-6
@@ -1120,6 +1123,8 @@ class PathNLPSolver:
             result.control_params,
             self.control_param
         )
+        if result.time_durations:
+            result.total_duration = float(sum(result.time_durations.values()))
 
         return result
 
@@ -1985,7 +1990,7 @@ class IntegratedMIOCPSolver:
         result.solve_time = time.time() - start_time
         result.pipeline_mode = "integrated"
         return result
-    
+
     def _build_and_solve_integrated_miocp(self, start_state: np.ndarray,
                                           goal_state: np.ndarray,
                                           verbose: bool) -> OptimizationResult:
@@ -2865,5 +2870,38 @@ def create_integrated_optimizer_from_config(graph: RegionGraph,
         adaptive_refine_enabled=optimizer_config.get('adaptive_refine_enabled', True),
         screening_safety_mode=optimizer_config.get('screening_safety_mode', None),
     )
-    
+
+    if solver_mode == "centroid_refine_dms":
+        crd_dict = config_dict.get('centroid_refine_dms', {})
+        crd_config = CentroidRefineDMSConfig(
+            gamma_w=float(crd_dict.get('gamma_w', 1.0)),
+            gamma_h=float(crd_dict.get('gamma_h', 0.64)),
+            alpha_s=float(crd_dict.get('alpha_s', 0.0)),
+            delta_safe=float(crd_dict.get('delta_safe', 0.02)),
+            delta_extra=float(crd_dict.get('delta_extra', 0.01)),
+            v_nom_fraction=float(crd_dict.get('v_nom_fraction', 0.5)),
+            alpha_mu=float(crd_dict.get('alpha_mu', 0.1)),
+            tau=float(crd_dict.get('tau', 0.1)),
+            mu_min=float(crd_dict.get('mu_min', 1e-5)),
+            n_int=int(crd_dict.get('n_int', 20)),
+            delta_min=float(crd_dict.get('delta_min', 0.01)),
+            delta_max=float(crd_dict.get('delta_max', 10.0)),
+            w_T=float(crd_dict.get('w_T', 1.0)),
+            w_L=float(crd_dict.get('w_L', 1.0)),
+            w_U=float(crd_dict.get('w_U', 1.0)),
+            w_S=float(crd_dict.get('w_S', 0.2)),
+            epsilon_final=float(crd_dict.get('epsilon_final', 1e-6)),
+            epsilon_gap=float(crd_dict.get('epsilon_gap', 0.05)),
+            time_limit_s=float(crd_dict.get('time_limit_s', 60.0)),
+            mode=str(crd_dict.get('mode', 'first_feasible')),
+            use_centroid_cost=bool(crd_dict.get('use_centroid_cost', True)),
+            use_interface_qp=bool(crd_dict.get('use_interface_qp', True)),
+            use_log_barrier=bool(crd_dict.get('use_log_barrier', True)),
+            use_barrier_continuation=bool(crd_dict.get('use_barrier_continuation', True)),
+            use_inexact_tolerance=bool(crd_dict.get('use_inexact_tolerance', True)),
+        )
+        return CentroidRefineDMSSolver(graph, dynamics, crd_config)
+
+    if solver_mode == "two_stage":
+        return TwoStageGCSDMSSolver(graph, dynamics, opt_config)
     return IntegratedMIOCPSolver(graph, dynamics, opt_config)

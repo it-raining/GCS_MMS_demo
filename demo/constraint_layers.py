@@ -245,7 +245,18 @@ def build_activation_constraints(region_nodes: Sequence[str],
                                  delta_min: float,
                                  delta_max: float,
                                  rho_big_m: float) -> ConstraintTriplet:
-    """Force region-local variables to zero when a region is inactive."""
+    """
+    TYPE-A Big-M: force region-local variables to zero when a region is inactive.
+
+        |s_minus|, |s_plus| <= state_big_m * p
+        |w|                 <= control_big_m * p
+        delta_min*p <= delta <= delta_max * p
+        rho                 <= rho_big_m * p
+
+    Used only in the integrated one-phase relaxation.  The fixed-path NLP
+    (PathNLPSolver) creates no variables for inactive regions and needs no
+    activation Big-M.
+    """
     g: List[ca.MX] = []
     lbg: List[float] = []
     ubg: List[float] = []
@@ -275,7 +286,30 @@ def build_integrated_dynamics_constraints(region_nodes: Sequence[str],
                                           F_endpoint: Callable,
                                           local_cost_fn: Callable,
                                           cost_weights: Tuple[float, float, float, float]) -> ConstraintTriplet:
-    """Build exact defect constraints and local cost epigraphs."""
+    """
+    Build exact DMS defect constraints and local cost epigraphs.
+
+    Constraints added for each region v:
+        s_plus_v = F_endpoint(s_minus_v, w_v, delta_v)   [nonlinear equality]
+        local_cost(s_minus_v, w_v, delta_v) <= rho_v      [epigraph]
+
+    NOTE: We intentionally do NOT perspective-transform the nonlinear DMS defect
+    equality ``s_plus = F_endpoint(s_minus, w, delta)``.
+
+    F_endpoint integrates unicycle dynamics dx/dt = [v cos θ, v sin θ, ω] over
+    [0,1] via RK4 with time-scaling by delta.  This map is nonlinear in
+    (s_minus, w, delta) due to cos(θ), sin(θ), and the delta * f(x,u) product.
+
+    Perspective transformation applies to constraints of the form A x <= b
+    (convex polytope containment).  The DMS defect is a nonlinear equality,
+    not a convex set containment condition.  Scaling by an activation variable
+    p would produce a nonlinear expression that is neither convex nor equivalent
+    to the original.
+
+    For inactive regions the Type-A activation constraints (build_activation_constraints)
+    force s_minus → 0, w → 0, delta → 0, so F_endpoint(0, 0, 0) = 0 = s_plus,
+    making the defect trivially satisfied without any Big-M on the defect itself.
+    """
     g: List[ca.MX] = []
     lbg: List[float] = []
     ubg: List[float] = []
@@ -306,7 +340,21 @@ def build_integrated_geometry_constraints(graph: RegionGraph,
                                           safety_margin: float,
                                           boundary_tolerance: float,
                                           position_big_m: float) -> ConstraintTriplet:
-    """Build Big-M guarded region membership and safety constraints."""
+    """
+    TYPE-B Big-M: guard region membership and interior safety for active regions.
+
+    For each active region v (p_v = 1):
+        A_v q_endpoint - b_v <= position_big_m * (1 - p_v)  [endpoint containment]
+        A_v q_mesh     - b_v <= position_big_m * (1 - p_v)  [interior safety]
+
+    This is a standard Big-M relaxation of convex polytope containment.
+    It can in principle be replaced by a perspective/homogenized form:
+        A_v q_tilde_v <= b_v * p_v
+    where q_tilde_v = p_v * q_v is a new scaled variable.  However, that
+    substitution requires creating separate scaled position variables and
+    only applies to the 2D position projection, NOT the full state.  See
+    build_perspective_region_position_constraints for the GCS-style form.
+    """
     g: List[ca.MX] = []
     lbg: List[float] = []
     ubg: List[float] = []
@@ -351,7 +399,36 @@ def build_integrated_coupling_constraints(graph: RegionGraph,
                                           start_state: np.ndarray,
                                           goal_state: np.ndarray,
                                           enforce_control_continuity: bool) -> ConstraintTriplet:
-    """Build Big-M guarded interface, source, and target coupling constraints."""
+    """
+    Big-M guarded interface, source, and target coupling constraints.
+
+    For each region-region edge e = (u, v):
+      TYPE-C (edge activation):
+        |z_e| <= state_big_m * y_e              — force interface state to 0
+      TYPE-B/C (interface containment):
+        A_u z_pos - b_u <= position_big_m*(1-y_e)
+        A_v z_pos - b_v <= position_big_m*(1-y_e)  — z in intersection when active
+      TYPE-D (interface equality):
+        |s_plus_u - z_e| <= interface_big_m*(1-y_e)
+        |s_minus_v - z_e| <= interface_big_m*(1-y_e)  — continuity across edge
+      TYPE-E (control continuity, optional):
+        |u_exit_u - u_entry_v| <= control_big_m*(1-y_e)
+
+    For source/target edges:
+      TYPE-D (boundary conditions):
+        |pos(s_minus_v) - start_pos| <= interface_big_m*(1-y_e)
+        |pos(s_plus_u)  - goal_pos|  <= interface_big_m*(1-y_e)
+
+    NOTES:
+    - TYPE-C/B interface containment (z in convex set) can be replaced by a
+      perspective form: A_u z_tilde_e <= b_u*y_e, A_v z_tilde_e <= b_v*y_e.
+      See build_perspective_edge_position_constraints.
+    - TYPE-D interface equality Big-M (s_plus = z when y=1) is harder to
+      replace because s_plus = F_endpoint(s_minus, w, delta) is nonlinear.
+      The cleanest removal is path-first decomposition (TwoStageGCSDMSSolver).
+    - TYPE-E control continuity Big-M can be replaced by a direct equality in
+      the fixed-path NLP (build_fixed_path_coupling_constraints).
+    """
     g: List[ca.MX] = []
     lbg: List[float] = []
     ubg: List[float] = []
