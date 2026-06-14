@@ -110,6 +110,7 @@ class GraphBuilderTests(unittest.TestCase):
             start_pos=np.array([0.25, 0.25]),
             goal_pos=np.array([1.75, 1.75]),
             adjacency_regions=adjacency_regions,
+            adjacency_tolerance=0.0,
         )
 
         self.assertIn(("R0", "R1"), buffered_graph.region_edges)

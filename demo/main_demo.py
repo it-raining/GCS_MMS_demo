@@ -72,17 +72,19 @@ def visualize_environment_only(config_path: str, scenario_name: str | None = Non
     plt.show()
 
 
-def run_single_scenario(config_path: str, scenario_name: str, verbose: bool = True):
+def run_single_scenario(config_path: str, scenario_name: str,
+                        verbose: bool = True, save_md: bool | None = None):
     """Run one configured scenario and persist its outputs."""
     from experiments import ExperimentRunner
 
     runner = ExperimentRunner(config_path=config_path)
     exp_result, prepared = runner.run_scenario(scenario_name, verbose=verbose)
-    runner.save_results({scenario_name: (exp_result, prepared)})
+    runner.save_results({scenario_name: (exp_result, prepared)}, save_md=save_md)
     return exp_result
 
 
-def run_all_experiments(config_path: str, verbose: bool = True):
+def run_all_experiments(config_path: str, verbose: bool = True,
+                        save_md: bool | None = None):
     """Run all configured scenarios."""
     from experiments import ExperimentRunner
 
@@ -93,7 +95,7 @@ def run_all_experiments(config_path: str, verbose: bool = True):
 
     runner = ExperimentRunner(config_path=config_path)
     results = runner.run_all_scenarios(verbose=verbose)
-    runner.save_results(results)
+    runner.save_results(results, save_md=save_md)
 
     print("\n" + "=" * 70)
     print("  Demo Complete!")
@@ -314,6 +316,8 @@ Examples:
     parser.add_argument("--maze-wall-thickness", type=float, default=0.08, help="Thickness of generated interior maze walls")
     parser.add_argument("--maze-debug-geometry", action="store_true", help="Save workspace + hole geometry plots before ACD")
     parser.add_argument("--quiet", action="store_true", help="Reduce output verbosity")
+    parser.add_argument("--save-md", action="store_true", default=None,
+                        help="Save Markdown reports to docs/ (overrides config if set)")
 
     args = parser.parse_args()
     config = DemoConfig(args.config)
@@ -369,12 +373,15 @@ Examples:
         )
         return
 
+    save_md = args.save_md  # None means "use config default"
+
     if args.scenario:
-        run_single_scenario(args.config, args.scenario, verbose=not args.quiet)
+        run_single_scenario(args.config, args.scenario,
+                            verbose=not args.quiet, save_md=save_md)
         return
 
     print_formulation_summary()
-    run_all_experiments(args.config, verbose=not args.quiet)
+    run_all_experiments(args.config, verbose=not args.quiet, save_md=save_md)
 
 
 if __name__ == "__main__":

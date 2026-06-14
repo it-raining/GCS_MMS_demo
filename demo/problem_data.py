@@ -5,7 +5,7 @@ This module is intentionally data-only so new environments can be added
 without touching the application pipeline.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List
 
 
@@ -17,10 +17,10 @@ class ProblemPresetSpec:
     description: str
     workspace_vertices: List[List[float]]
     obstacle_vertices: List[List[List[float]]]
-    region_vertices: List[List[List[float]]]
     default_start_state: List[float]
     default_goal_state: List[float]
     region_buffer: float = 0.05
+    region_vertices: List[List[List[float]]] = field(default_factory=list)
 
 
 DEFAULT_PROBLEM = ProblemPresetSpec(
@@ -623,7 +623,44 @@ MAZE_PROBLEM = ProblemPresetSpec(
 )
 
 
+# CRD Demo preset: uses the same workspace+obstacles as DEFAULT_PROBLEM so that
+# ACD2D produces multiple convex regions. The mitre buffer (overlap_width from
+# config) creates the overlap needed by CentroidRefineDMS Interface QP.
+CRD_DEMO_PROBLEM = ProblemPresetSpec(
+    key="crd_demo",
+    name="CRD Demo — Default Workspace",
+    description=(
+        "Default 5x5 workspace with obstacles; ACD2D + mitre buffer provides "
+        "overlapping regions for CentroidRefineDMS."
+    ),
+    workspace_vertices=DEFAULT_PROBLEM.workspace_vertices,
+    obstacle_vertices=DEFAULT_PROBLEM.obstacle_vertices,
+    default_start_state=[0.2, 0.2, 0.785],
+    default_goal_state=[4.8, 4.8, 0.785],
+)
+
+
+MAZE_15_PROBLEM = ProblemPresetSpec(
+    key="maze_15",
+    name="Maze 15x15 - Zigzag Corridor",
+    description=(
+        "15x15 workspace with a horizontal barrier (y=6-9, x=0-9) forcing a zigzag: "
+        "bottom strip -> right-side passage (x=9-15) -> top strip. "
+        "ACD2D decomposes free space; mitre buffer creates overlap for CentroidRefineDMS."
+    ),
+    workspace_vertices=[[0.0, 0.0], [15.0, 0.0], [15.0, 15.0], [0.0, 15.0]],
+    obstacle_vertices=[
+        # Horizontal slab blocking left/middle vertical passage
+        [[0.0, 6.0], [9.0, 6.0], [9.0, 9.0], [0.0, 9.0]],
+    ],
+    default_start_state=[1.0, 1.0, 0.0],
+    default_goal_state=[1.0, 14.0, 1.5708],
+)
+
+
 PROBLEM_PRESETS: Dict[str, ProblemPresetSpec] = {
     DEFAULT_PROBLEM.key: DEFAULT_PROBLEM,
     MAZE_PROBLEM.key: MAZE_PROBLEM,
+    CRD_DEMO_PROBLEM.key: CRD_DEMO_PROBLEM,
+    MAZE_15_PROBLEM.key: MAZE_15_PROBLEM,
 }

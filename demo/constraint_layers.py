@@ -614,7 +614,7 @@ def build_barrier_log_terms(
             pos_k = dynamics.project_to_position_casadi(states_i[k])
             for j in range(region.A.shape[0]):
                 s_ijk = float(region.b[j]) - delta_safe - float(region.A[j, 0]) * pos_k[0] - float(region.A[j, 1]) * pos_k[1]
-                B = B - h_k * ca.log(s_ijk)
+                B = B - h_k * ca.log(ca.fmax(s_ijk, 1e-10))
     return B
 
 

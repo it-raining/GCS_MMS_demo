@@ -16,6 +16,7 @@ from geometric_refiner import (
 def _make_graph(regions):
     graph = MagicMock()
     graph.regions = regions
+    graph.intersections = {}
     return graph
 
 

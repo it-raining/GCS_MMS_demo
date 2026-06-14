@@ -1,8 +1,0 @@
-/home/dang-khoa/code/motion-planning/gcs-science-robotics/acd2d/build/CMakeFiles/acd2d_gui.dir
-/home/dang-khoa/code/motion-planning/gcs-science-robotics/acd2d/build/CMakeFiles/acd2d_cli.dir
-/home/dang-khoa/code/motion-planning/gcs-science-robotics/acd2d/build/CMakeFiles/edit_cache.dir
-/home/dang-khoa/code/motion-planning/gcs-science-robotics/acd2d/build/CMakeFiles/rebuild_cache.dir
-/home/dang-khoa/code/motion-planning/gcs-science-robotics/acd2d/build/CMakeFiles/list_install_components.dir
-/home/dang-khoa/code/motion-planning/gcs-science-robotics/acd2d/build/CMakeFiles/install.dir
-/home/dang-khoa/code/motion-planning/gcs-science-robotics/acd2d/build/CMakeFiles/install/local.dir
-/home/dang-khoa/code/motion-planning/gcs-science-robotics/acd2d/build/CMakeFiles/install/strip.dir

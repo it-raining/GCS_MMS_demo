@@ -1703,6 +1703,7 @@ class CentroidRefineDMSConfig:
     use_log_barrier: bool = True
     use_barrier_continuation: bool = True
     use_inexact_tolerance: bool = True
+    n_ctrl_per_seg: int = 1
 
 
 class CentroidRefineDMSSolver:
@@ -1723,7 +1724,7 @@ class CentroidRefineDMSSolver:
         self.dynamics = dynamics
         self.config = config
 
-    def solve(self, x_start: np.ndarray, x_goal: np.ndarray) -> OptimizationResult:
+    def solve(self, x_start: np.ndarray, x_goal: np.ndarray, verbose: bool = False) -> OptimizationResult:
         import time as _time
         from graph_builder import (
             add_composite_costs_to_graph, k_shortest_paths_generator, SOURCE, TARGET
@@ -1750,8 +1751,12 @@ class CentroidRefineDMSSolver:
 
         lb_geom = self._geometric_lb(x_start, x_goal)
 
+        _omega_max = getattr(self.dynamics, 'omega_max', np.pi)
+        _v_min_abs = abs(getattr(self.dynamics, 'v_min', 0.5))
+        _kappa_sq = (_v_min_abs / _omega_max) ** 2 if _omega_max > 0 else 0.0
         qp_cfg = InterfaceQPConfig(
-            delta_safe=cfg.delta_safe, delta_extra=cfg.delta_extra, lambda_s=cfg.alpha_s)
+            delta_safe=cfg.delta_safe, delta_extra=cfg.delta_extra,
+            lambda_s=cfg.alpha_s * _kappa_sq)
         ws_cfg = WarmStartConfig(
             delta_min=cfg.delta_min, delta_max=cfg.delta_max,
             v_nom_fraction=cfg.v_nom_fraction, n_int=cfg.n_int)
@@ -1760,7 +1765,9 @@ class CentroidRefineDMSSolver:
             delta_min=cfg.delta_min, delta_max=cfg.delta_max,
             w_T=cfg.w_T, w_L=cfg.w_L, w_U=cfg.w_U, w_S=cfg.w_S,
             alpha_mu=cfg.alpha_mu, tau=cfg.tau, mu_min=cfg.mu_min,
-            epsilon_final=cfg.epsilon_final)
+            epsilon_final=cfg.epsilon_final,
+            use_log_barrier=cfg.use_log_barrier,
+            n_ctrl_per_seg=cfg.n_ctrl_per_seg)
         barrier_solver = BarrierDMSSolver(self.dynamics, barrier_cfg)
 
         tried: set = set()
@@ -1808,7 +1815,14 @@ class CentroidRefineDMSSolver:
                 z = self._naive_z(path_regions, q_start, q_goal)
 
             try:
-                ws = generate_warm_start_ivp(z, path_regions, self.dynamics, ws_cfg)
+                _pos_set = set(self.dynamics.position_indices)
+                _ori = [i for i in range(self.dynamics.n_x) if i not in _pos_set]
+                _theta_s = float(x_start[_ori[0]]) if len(_ori) == 1 else None
+                _theta_e = float(x_goal[_ori[0]]) if len(_ori) == 1 else None
+                ws = generate_warm_start_ivp(
+                    z, path_regions, self.dynamics, ws_cfg,
+                    theta_start=_theta_s, theta_end=_theta_e,
+                )
             except Exception as e:
                 all_failures.append({'path': list(path),
                                      'code': FailureCode.WARM_START_VIOLATION, 'detail': str(e)})
@@ -1893,11 +1907,24 @@ class CentroidRefineDMSSolver:
             max_connection_gap=br.coupling_gap,
         )
         if br.x_nodes_opt is not None:
+            n_int_used = len(br.x_nodes_opt[0]) - 1 if br.x_nodes_opt else self.config.n_int
+            tau_arr = np.linspace(0.0, 1.0, n_int_used + 1)
             for seg_i, ridx in enumerate(path_regions):
-                result.entry_states[ridx] = br.x_nodes_opt[seg_i][0]
-                result.exit_states[ridx]  = br.x_nodes_opt[seg_i][-1]
+                traj_seg = br.x_nodes_opt[seg_i]   # (n_int+1, n_x)
+                delta_i  = br.delta_opt[seg_i]
+                result.entry_states[ridx]  = traj_seg[0]
+                result.exit_states[ridx]   = traj_seg[-1]
                 result.control_params[ridx] = br.u_list_opt[seg_i]
-                result.time_durations[ridx] = br.delta_opt[seg_i]
+                result.time_durations[ridx] = delta_i
+                result.trajectories.append((traj_seg, tau_arr.copy(), delta_i))
+                pos_idx = list(self.dynamics.position_indices)
+                mesh_pos = traj_seg[:, pos_idx]
+                result.mesh_samples.append((mesh_pos, tau_arr.copy(), delta_i))
+            for seg_i in range(len(path_regions) - 1):
+                ridx = path_regions[seg_i]
+                result.interface_points.append(
+                    self.dynamics.project_to_position(result.exit_states[ridx])
+                )
         if result.time_durations:
             result.total_duration = float(sum(result.time_durations.values()))
         return result
@@ -1984,6 +2011,7 @@ def create_integrated_optimizer_from_config(
             use_log_barrier=bool(crd_dict.get('use_log_barrier', True)),
             use_barrier_continuation=bool(crd_dict.get('use_barrier_continuation', True)),
             use_inexact_tolerance=bool(crd_dict.get('use_inexact_tolerance', True)),
+            n_ctrl_per_seg=int(crd_dict.get('n_ctrl_per_seg', 1)),
         )
         return CentroidRefineDMSSolver(graph, dynamics, crd_config)
 

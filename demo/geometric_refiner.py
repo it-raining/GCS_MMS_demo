@@ -12,6 +12,7 @@ import casadi as ca
 import numpy as np
 
 from graph_builder import RegionGraph, chebyshev_center
+from graph_types import region_node_label
 
 
 @dataclass
@@ -54,11 +55,20 @@ def solve_interface_refinement(
     n_pos = graph.regions[path_regions[0]].A.shape[1]
     margin = config.delta_safe + config.delta_extra
 
-    # Pre-solve narrow-interface check
+    def _interface_hrep(ri: int, ri1: int):
+        u_id = region_node_label(ri)
+        v_id = region_node_label(ri1)
+        isect = graph.intersections.get((u_id, v_id))
+        if isect is not None:
+            return isect.A, isect.b
+        A = np.vstack([graph.regions[ri].A, graph.regions[ri1].A])
+        b = np.concatenate([graph.regions[ri].b, graph.regions[ri1].b])
+        return A, b
+
+    # Pre-solve narrow-interface check using intersection polygon H-rep
     for i in range(m - 1):
         ri, ri1 = path_regions[i], path_regions[i + 1]
-        A_int = np.vstack([graph.regions[ri].A, graph.regions[ri1].A])
-        b_int = np.concatenate([graph.regions[ri].b, graph.regions[ri1].b])
+        A_int, b_int = _interface_hrep(ri, ri1)
         try:
             _, rho_ij = chebyshev_center(A_int, b_int)
         except ValueError:
@@ -86,21 +96,22 @@ def solve_interface_refinement(
 
     for i in range(m):
         z_i = z_vars[i]
-        region_i = graph.regions[path_regions[i]]
-        A_i = ca.DM(region_i.A)
-        b_i = ca.DM(region_i.b.reshape(-1, 1))
-        constr_i = ca.mtimes(A_i, z_i) - (b_i - margin)
-        for j in range(region_i.A.shape[0]):
-            g_list.append(constr_i[j])
-            lbg.append(-np.inf)
-            ubg.append(0.0)
         if i < m - 1:
-            region_next = graph.regions[path_regions[i + 1]]
-            A_n = ca.DM(region_next.A)
-            b_n = ca.DM(region_next.b.reshape(-1, 1))
-            constr_n = ca.mtimes(A_n, z_i) - (b_n - margin)
-            for j in range(region_next.A.shape[0]):
-                g_list.append(constr_n[j])
+            # Interface point: constrain to intersection polygon H-rep
+            A_c, b_c = _interface_hrep(path_regions[i], path_regions[i + 1])
+            constr = ca.mtimes(ca.DM(A_c), z_i) - (ca.DM(b_c.reshape(-1, 1)) - margin)
+            for j in range(A_c.shape[0]):
+                g_list.append(constr[j])
+                lbg.append(-np.inf)
+                ubg.append(0.0)
+        else:
+            # Last waypoint: constrain to last region only
+            region_last = graph.regions[path_regions[i]]
+            A_l = ca.DM(region_last.A)
+            b_l = ca.DM(region_last.b.reshape(-1, 1))
+            constr = ca.mtimes(A_l, z_i) - (b_l - margin)
+            for j in range(region_last.A.shape[0]):
+                g_list.append(constr[j])
                 lbg.append(-np.inf)
                 ubg.append(0.0)
 

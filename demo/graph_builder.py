@@ -8,6 +8,7 @@ Constructs graph G = (V, E) where:
 Edges are created based on geometric adjacency (shared edge or overlap).
 """
 
+import math
 import numpy as np
 import networkx as nx
 from typing import List, Dict, Tuple, Optional, Set
@@ -59,6 +60,8 @@ class RegionGraph:
     start_pos: np.ndarray
     goal_pos: np.ndarray
     adjacency_regions: Optional[List[ConvexRegion]] = None
+    adjacency_tolerance: float = 0.005
+    obs_polys: List = field(default_factory=list)
     graph: nx.DiGraph = field(default_factory=nx.DiGraph)
     source_edges: List[Tuple[str, str]] = field(default_factory=list)
     target_edges: List[Tuple[str, str]] = field(default_factory=list)
@@ -107,13 +110,33 @@ class RegionGraph:
                 node_id = region_node_label(region.index)
                 self.graph.add_edge(SOURCE, node_id, edge_type='source')
                 self.source_edges.append((SOURCE, node_id))
-        
+
+        if not self.source_edges and self.regions:
+            nearest = min(self.regions,
+                          key=lambda r: float(np.linalg.norm(r.get_centroid() - self.start_pos)))
+            node_id = region_node_label(nearest.index)
+            self.graph.add_edge(SOURCE, node_id, edge_type='source')
+            self.source_edges.append((SOURCE, node_id))
+            print(f"Warning: start_pos {self.start_pos} not in any region; "
+                  f"snapping source edge to nearest region {nearest.index} "
+                  f"(centroid {nearest.get_centroid()})")
+
         # Add target edges (v -> target for v containing goal)
         for region in self.regions:
             if region.contains(self.goal_pos, margin=0):
                 node_id = region_node_label(region.index)
                 self.graph.add_edge(node_id, TARGET, edge_type='target')
                 self.target_edges.append((node_id, TARGET))
+
+        if not self.target_edges and self.regions:
+            nearest = min(self.regions,
+                          key=lambda r: float(np.linalg.norm(r.get_centroid() - self.goal_pos)))
+            node_id = region_node_label(nearest.index)
+            self.graph.add_edge(node_id, TARGET, edge_type='target')
+            self.target_edges.append((node_id, TARGET))
+            print(f"Warning: goal_pos {self.goal_pos} not in any region; "
+                  f"snapping target edge to nearest region {nearest.index} "
+                  f"(centroid {nearest.get_centroid()})")
         
         # Add inter-region edges (u -> v if Q_u and Q_v share an edge or overlap).
         # Connectivity may be evaluated on unbuffered adjacency regions so tiny
@@ -124,14 +147,18 @@ class RegionGraph:
                 if i == j:
                     continue
                 
-                if regions_intersect(self._adjacency_regions[i], self._adjacency_regions[j]):
+                if regions_intersect(self._adjacency_regions[i], self._adjacency_regions[j],
+                                     tolerance=self.adjacency_tolerance):
                     u_id = region_node_label(self.regions[i].index)
                     v_id = region_node_label(self.regions[j].index)
-                    
-                    # Compute intersection for interface constraints
+
+                    # Adjacency is decided on unbuffered regions (above), but the
+                    # interface region for CRD interface QP must use the buffered
+                    # regions so the intersection has non-zero Chebyshev radius.
                     intersection = compute_intersection(
-                        self._adjacency_regions[i],
-                        self._adjacency_regions[j],
+                        self.regions[i],
+                        self.regions[j],
+                        obs_polys=self.obs_polys if self.obs_polys else None,
                     )
                     
                     self.graph.add_edge(u_id, v_id, 
@@ -249,13 +276,15 @@ class RegionGraph:
             print(f"  Simple paths: >= {len(paths)} (limit reached)")
 
 
-def build_region_graph(regions: List[ConvexRegion], 
+def build_region_graph(regions: List[ConvexRegion],
                        start_pos: np.ndarray,
                        goal_pos: np.ndarray,
-                       adjacency_regions: Optional[List[ConvexRegion]] = None) -> RegionGraph:
+                       adjacency_regions: Optional[List[ConvexRegion]] = None,
+                       adjacency_tolerance: float = 0.005,
+                       obs_polys: Optional[List] = None) -> RegionGraph:
     """
     Build region graph from convex regions and start/goal positions.
-    
+
     Args:
         regions: List of ConvexRegion objects
         start_pos: 2D start position
@@ -263,7 +292,15 @@ def build_region_graph(regions: List[ConvexRegion],
         adjacency_regions: Optional regions used for region-region adjacency.
             This is useful when optimization uses buffered regions but graph
             topology should be determined by the original unbuffered geometry.
-        
+        adjacency_tolerance: Outward dilation (metres) applied to each adjacency
+            region before the intersection test.  Converts vertex-only contacts
+            into detectable area overlaps.  Must be < half the minimum wall
+            thickness to avoid bridging across walls.  Default 0.005 (safe for
+            the maze preset whose walls are 0.02 units thick).
+        obs_polys: Shapely Polygon objects for each obstacle.  When provided,
+            intersection H-reps are tightened so NLP transition constraints
+            cannot place trajectory nodes inside obstacles.
+
     Returns:
         RegionGraph object
     """
@@ -272,6 +309,8 @@ def build_region_graph(regions: List[ConvexRegion],
         start_pos=start_pos,
         goal_pos=goal_pos,
         adjacency_regions=adjacency_regions,
+        adjacency_tolerance=adjacency_tolerance,
+        obs_polys=obs_polys or [],
     )
 
 
@@ -338,6 +377,12 @@ def chebyshev_center(A: np.ndarray, b: np.ndarray) -> "Tuple[np.ndarray, float]"
     return res.x[:n].copy(), float(res.x[n])
 
 
+def _angle_diff(a: float, b: float) -> float:
+    """Signed angle difference (b - a) normalized to (-pi, pi]."""
+    d = b - a
+    return math.atan2(math.sin(d), math.cos(d))
+
+
 def add_composite_costs_to_graph(
     graph: RegionGraph,
     start_pos: np.ndarray,
@@ -346,7 +391,8 @@ def add_composite_costs_to_graph(
     gamma_h: float = 0.64,
 ) -> "Dict[int, Tuple[np.ndarray, float]]":
     """
-    Annotate graph edges with 'composite_cost' = centroid_dist - gamma_w*interface_radius.
+    Annotate graph edges with composite_cost = dist - gamma_w*rho_ij + gamma_h*|Δθ|².
+    Turn penalty γ_h·|Δθ|² is averaged over incoming headings at the source node.
     Returns dict mapping region_index -> (chebyshev_center, chebyshev_radius).
     """
     centers: Dict[int, "Tuple[np.ndarray, float]"] = {}
@@ -367,19 +413,34 @@ def add_composite_costs_to_graph(
             rho_ij = 0.0
         interface_radii[edge] = rho_ij
 
+    # Pass 1: compute and cache heading + raw cost for every edge
+    edge_cache: Dict["Tuple[str, str]", "Tuple[float, float, float]"] = {}
     for u, v, data in graph.graph.edges(data=True):
-        if u == SOURCE:
-            p1 = start_pos.astype(float)
-        else:
-            p1 = centers[region_index_from_node_id(u)][0]
-        if v == TARGET:
-            p2 = goal_pos.astype(float)
-        else:
-            p2 = centers[region_index_from_node_id(v)][0]
-        dist = float(np.linalg.norm(p2 - p1))
-        rho_interface = interface_radii.get((u, v), 0.0)
-        cost = dist - gamma_w * rho_interface
-        data['composite_cost'] = max(cost, 1e-9)
+        p1 = start_pos.astype(float) if u == SOURCE else centers[region_index_from_node_id(u)][0]
+        p2 = goal_pos.astype(float)  if v == TARGET else centers[region_index_from_node_id(v)][0]
+        d = p2 - p1
+        dist = float(np.linalg.norm(d))
+        heading = math.atan2(float(d[1]), float(d[0])) if dist > 1e-9 else 0.0
+        rho = interface_radii.get((u, v), 0.0)
+        data['heading'] = heading
+        edge_cache[(u, v)] = (dist, heading, rho)
+
+    # Pass 2: add turn penalty averaged over incoming edge headings at node u
+    for (u, v), (dist, heading_uv, rho) in edge_cache.items():
+        turn_cost = 0.0
+        if gamma_h > 0.0 and u not in (SOURCE, TARGET):
+            incoming_h = [
+                edge_cache[(pw, u)][1]
+                for pw in graph.graph.predecessors(u)
+                if (pw, u) in edge_cache
+            ]
+            if incoming_h:
+                turn_cost = gamma_h * sum(
+                    _angle_diff(h_in, heading_uv) ** 2 for h_in in incoming_h
+                ) / len(incoming_h)
+
+        cost = dist - gamma_w * rho + turn_cost
+        graph.graph[u][v]['composite_cost'] = max(cost, 1e-9)
 
     return centers
 
@@ -390,5 +451,12 @@ def k_shortest_paths_generator(
     target: str,
     weight: str = 'composite_cost',
 ):
-    """Generator yielding simple paths source->target in non-decreasing composite cost (Yen's)."""
-    return nx.shortest_simple_paths(graph.graph, source, target, weight=weight)
+    """Generator yielding simple paths source->target in non-decreasing composite cost (Yen's).
+
+    Yields nothing when no path exists, so callers catching StopIteration
+    work correctly even when source has no outgoing edges.
+    """
+    try:
+        yield from nx.shortest_simple_paths(graph.graph, source, target, weight=weight)
+    except nx.NetworkXNoPath:
+        return
