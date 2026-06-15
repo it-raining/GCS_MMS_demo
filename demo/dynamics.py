@@ -124,6 +124,14 @@ class DynamicsModel(ABC):
         """Return a Big-M value for angular state components."""
         return 2.0 * np.pi
 
+    @abstractmethod
+    def compute_lipschitz_bound(self, A_list: List[np.ndarray]) -> float:
+        """
+        Return L_s = max_{i,j} ||a_{i,j}||_2 * v_max.
+        A_list: list of halfspace matrices (one per region on the path).
+        """
+        pass
+
 
 @dataclass
 class UnicycleModel(DynamicsModel):
@@ -258,11 +266,83 @@ class UnicycleModel(DynamicsModel):
     def get_control_bounds(self) -> Tuple[np.ndarray, np.ndarray]:
         """
         Get control bounds.
-        
+
         Returns:
             (u_min, u_max) arrays
         """
         return self.control_bounds()
+
+    def compute_lipschitz_bound(self, A_list: List[np.ndarray]) -> float:
+        max_normal = max(
+            float(np.linalg.norm(A[j]))
+            for A in A_list
+            for j in range(A.shape[0])
+        )
+        return max_normal * self.v_max
+
+
+@dataclass
+class DoubleIntegratorDynamics(DynamicsModel):
+    """Double integrator: state=[px,py,vx,vy], control=[ax,ay]"""
+    v_max: float = 2.0
+    a_max: float = 2.0
+
+    @property
+    def n_x(self) -> int:
+        return 4
+
+    @property
+    def n_u(self) -> int:
+        return 2
+
+    @property
+    def n_pos(self) -> int:
+        return 2
+
+    @property
+    def position_indices(self) -> Tuple[int, ...]:
+        return (0, 1)
+
+    def f(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
+        return np.array([x[2], x[3], u[0], u[1]], dtype=float)
+
+    def f_casadi(self, x: ca.MX, u: ca.MX) -> ca.MX:
+        return ca.vertcat(x[2], x[3], u[0], u[1])
+
+    def project_to_position(self, x: np.ndarray) -> np.ndarray:
+        return x[:2].copy()
+
+    def project_to_position_casadi(self, x: ca.MX) -> ca.MX:
+        return x[:2]
+
+    def position_velocity(self, x: np.ndarray, u: np.ndarray) -> np.ndarray:
+        return x[2:4].copy()
+
+    def position_velocity_casadi(self, x: ca.MX, u: ca.MX) -> ca.MX:
+        return x[2:4]
+
+    def state_bounds(self, position_lb=None, position_ub=None):
+        if position_lb is None:
+            position_lb = np.array([-np.inf, -np.inf], dtype=np.float64)
+        if position_ub is None:
+            position_ub = np.array([np.inf, np.inf], dtype=np.float64)
+        lb = np.array([position_lb[0], position_lb[1], -self.v_max, -self.v_max], dtype=np.float64)
+        ub = np.array([position_ub[0], position_ub[1],  self.v_max,  self.v_max], dtype=np.float64)
+        return lb, ub
+
+    def control_bounds(self):
+        return (
+            np.array([-self.a_max, -self.a_max], dtype=np.float64),
+            np.array([ self.a_max,  self.a_max], dtype=np.float64),
+        )
+
+    def compute_lipschitz_bound(self, A_list: List[np.ndarray]) -> float:
+        max_normal = max(
+            float(np.linalg.norm(A[j]))
+            for A in A_list
+            for j in range(A.shape[0])
+        )
+        return max_normal * self.v_max
 
 
 class ControlParameterization:

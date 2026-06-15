@@ -403,3 +403,57 @@ def build_integrated_coupling_constraints(graph: RegionGraph,
         _append_leq(g, lbg, ubg, -diff - interface_big_m * (1 - y))
 
     return g, lbg, ubg
+
+
+def build_barrier_log_terms(
+    path_regions,
+    graph,
+    dynamics,
+    x_node_vars,
+    delta_list,
+    n_int: int,
+    delta_safe: float,
+    endpoint_delta_safe=None,
+    node_delta_safe=None,
+):
+    """Compute B = -Sigma_{i,j,k} h_k * log(s_{i,j,k}) as a CasADi expression."""
+    B = ca.MX(0.0)
+    for seg_idx, region_idx in enumerate(path_regions):
+        region = graph._regions_by_index[region_idx]
+        delta_i = delta_list[seg_idx]
+        states_i = x_node_vars[seg_idx]
+        for k in range(n_int + 1):
+            if k == 0 or k == n_int:
+                h_k = delta_i / (2.0 * n_int)
+            else:
+                h_k = delta_i / n_int
+            x_k = states_i[k]
+            pos_k = dynamics.project_to_position_casadi(x_k)
+            margin_k = delta_safe
+            if node_delta_safe is not None:
+                margin_k = float(node_delta_safe[seg_idx, k])
+            elif endpoint_delta_safe is not None and (
+                (seg_idx == 0 and k == 0)
+                or (seg_idx == len(path_regions) - 1 and k == n_int)
+            ):
+                margin_k = endpoint_delta_safe
+            for j in range(region.A.shape[0]):
+                a_j = region.A[j, :]
+                b_j = float(region.b[j])
+                s_ijk = b_j - margin_k - float(a_j[0]) * pos_k[0] - float(a_j[1]) * pos_k[1]
+                B = B - h_k * ca.log(s_ijk)
+    return B
+
+
+def compute_lipschitz_safety_gap(
+    dynamics,
+    path_regions,
+    graph,
+    delta_arr,
+    n_int: int,
+) -> float:
+    """Return L_s * h_rk4_max / 2."""
+    A_list = [graph._regions_by_index[ri].A for ri in path_regions]
+    L_s = dynamics.compute_lipschitz_bound(A_list)
+    h_rk4_max = float(np.max(delta_arr)) / n_int
+    return L_s * h_rk4_max / 2.0

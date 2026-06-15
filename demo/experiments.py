@@ -8,7 +8,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 from app_config import DemoConfig
 from optimizer import OptimizationResult
@@ -65,6 +65,24 @@ class ExperimentResult:
         return "\n".join(lines)
 
 
+@dataclass
+class ScenarioResult:
+    """Lightweight result record for centroid_refine_dms scenario comparison."""
+    scenario_name: str
+    solver_type: str
+    success: bool
+    total_cost: float
+    solve_time: float
+    n_paths_evaluated: int
+    path_regions: List[int]
+    formulation_mode: str = "INTEGRATED_MIOCP"
+    min_safety_margin: float = float("nan")
+    certified_safety_margin: float = float("nan")
+    lipschitz_gap: float = float("nan")
+    safety_certification: str = "NOT_SET"
+    solver_status: str = ""
+
+
 class ExperimentRunner:
     """Run configured scenarios with the integrated IPOPT-based solver."""
 
@@ -95,7 +113,7 @@ class ExperimentRunner:
 
         if verbose:
             print(f"Enumerated {n_paths} candidate paths")
-            print("\nSolving integrated one-phase MIOCP relaxation...")
+            print("\nSolving with CentroidRefineDMS...")
 
         result = prepared.optimizer.solve(
             prepared.resolved.start_state,
@@ -148,6 +166,7 @@ class ExperimentRunner:
             prefix = os.path.join(self.output_dir, scenario_name)
 
             if save_png:
+                from visualization import create_velocity_profile_figure
                 fig = create_result_figure(
                     opt_result,
                     prepared.graph,
@@ -160,6 +179,11 @@ class ExperimentRunner:
                 fig.savefig(f"{prefix}_result.png")
                 plt.close(fig)
                 print(f"Saved: {prefix}_result.png")
+
+                fig_profile = create_velocity_profile_figure(opt_result)
+                fig_profile.savefig(f"{prefix}_velocity_profile.png", dpi=150)
+                plt.close(fig_profile)
+                print(f"Saved: {prefix}_velocity_profile.png")
 
             if save_gif and opt_result.success:
                 try:

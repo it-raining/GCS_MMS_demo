@@ -1,274 +1,187 @@
 # =============================================================================
 # Configuration for GCS-MMS Motion Planning Demo
 # =============================================================================
-# This demo implements a hybrid discrete-continuous motion planning framework:
-# - Discrete path selection on graph of convex sets (GCS-style)
-# - Continuous trajectory optimization via direct multiple shooting
-# - On/off convex geometry with Big-M encoding (approximating perspective)
-# - Explicit discrete-continuous coupling
-#
-# Classification: MIOCP (continuous-time) -> MINLP (after transcription)
+# Primary solver: centroid_refine_dms (CRD)
+# All legacy IntegratedMIOCPSolver / two_stage options have been removed.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
 # Problem Preset
 # -----------------------------------------------------------------------------
 problem:
-  # Geometry presets are registered in problem_data.py
-  default_preset: "maze"
+  # Fallback preset when a scenario does not declare problem_preset.
+  default_preset: "default"
 
 # -----------------------------------------------------------------------------
-# Start and Goal States
+# Region Decomposition
 # -----------------------------------------------------------------------------
-# State format: [px, py, theta] for unicycle model
-# Note: theta is heading angle in radians
-# These are global defaults and can be overridden per scenario.
+# Each ACD2D polygon is expanded outward by overlap_width (Shapely mitre buffer
+# + workspace clip). Two adjacent regions share an overlap band of width
+# 2*overlap_width. Must satisfy: overlap_width >= delta_safe + delta_extra.
+region_decomposition:
+  overlap_width: 0.5
+
+# -----------------------------------------------------------------------------
+# Start and Goal States  (global defaults; overridable per scenario)
+# -----------------------------------------------------------------------------
+# State format: [px, py, theta]  (theta in radians)
 start_state:
   position: [0.2, 0.2]
-  heading: 0.785  # 45 degrees, pointing toward goal
+  heading: 0.785   # 45 degrees
 
 goal_state:
   position: [4.8, 4.8]
-  heading: 0.785  # 45 degrees
+  heading: 0.785
 
 # -----------------------------------------------------------------------------
-# Dynamics Configuration
+# Dynamics
 # -----------------------------------------------------------------------------
 dynamics:
-  model: "unicycle"  # Currently only unicycle supported
-  
-  # State dimension: n_x = 3 (px, py, theta)
-  # Control dimension: n_u = 2 (v, omega)
-  
-  # Control bounds
-  v_min: -2.0      # minimum linear velocity
-  v_max: 2.0       # maximum linear velocity
-  omega_min: -3.14159  # minimum angular velocity (-pi)
-  omega_max: 3.14159   # maximum angular velocity (pi)
-  
-  # Time bounds per region
-  delta_min: 0.01  # minimum time in each region
-  delta_max: 10.0  # maximum time in each region
+  model: "unicycle"
+  v_min: -2.0
+  v_max: 2.0
+  omega_min: -3.14159   # -pi
+  omega_max:  3.14159   #  pi
+  # omega_min: -1.5707      # -pi/2 (tighter heading-change penalty in graph search heuristic)
+  # omega_max: 1.5707       #  pi/2
+  delta_min: 0.1        # minimum dwell time per region [s]
+  delta_max: 3.0        # bounds h_max for the Lipschitz safety certificate [s]
 
 # -----------------------------------------------------------------------------
 # Control Parameterization
 # -----------------------------------------------------------------------------
 control:
-  # Type of parameterization on each region
-  # Options: "constant" (one control per region), "piecewise_constant" (N segments)
   parameterization: "piecewise_constant"
-  
-  # Number of control segments per region (for piecewise_constant)
-  n_segments: 2
+  n_segments: 2   # piecewise-constant segments per region
 
 # -----------------------------------------------------------------------------
-# Multiple Shooting Configuration
+# Multiple Shooting
 # -----------------------------------------------------------------------------
 shooting:
-  # Number of integration steps for RK4 within each region
+  # RK4 integration steps per region (used by CRD as n_int).
+  # Larger n_int reduces the Lipschitz gap and improves safety certification,
+  # at the cost of a larger NLP.
   n_integration_steps: 10
-  
-  # Number of mesh points for safety constraint sampling
-  # These are points where we check A_v * x(tau_k) <= b_v - epsilon
-  n_mesh_points: 3
-  
-  # Safety margin epsilon for region containment
-  safety_margin: 0.01
-
-  # Optional control barrier function safety layer for fixed-path polishing.
-  # Set to 0.0 to disable and use mesh containment only.
-  cbf_alpha: 0.0
-
-  # Minimum duration for active local trajectory segments. This is separate
-  # from dynamics.delta_min because very small active durations can hide
-  # geometric CTCS violations when using physical-time integrals.
-  active_delta_min: 0.05
-
-  # Safety transcription mode:
-  #   mesh: finite interior mesh constraints A*pi(x_k) <= b - margin
-  #   ctcs: RK4 approximation of accumulated path-constraint violation
-  #   both: enforce mesh constraints and the CTCS safety certificate
-  safety_mode: "ctcs"
-  ctcs_tolerance: 1.0e-6
-  ctcs_penalty: "squared_hinge"
-  # normalized: integral_0^1 Lambda(x(tau)) dtau; safer for geometry
-  # physical_time: integral_0^1 Delta*Lambda(x(tau)) dtau
-  ctcs_integral_mode: "normalized"
-  ctcs_use_rk4_stages: true
-  ctcs_eta_big_m: 100.0
-
-  # Dense post-solve verification samples the active local trajectories and
-  # reports max_i,tau A_i*pi(x(tau)) - (b_i - safety_margin).
-  dense_check_points: 10
-  dense_check_tolerance: 1.0e-4
-  fail_on_dense_violation: true
 
 # -----------------------------------------------------------------------------
-# Cost Function Weights
+# Cost Function
 # -----------------------------------------------------------------------------
-# Total cost: sum_v rho_v where
-# rho_v >= J_v = a * Delta_v
-#            + integral[w_L * ||q_dot||^2 + w_E * ||u||^2] dtau
-#            + w_u_smooth * sum_k ||u_{k+1} - u_k||^2
+# CRD cost per region: w_T*Delta + integral(w_L*||q_dot||^2 + w_U*||u||^2)dtau
+#                    + w_S * sum_k ||u_{k+1} - u_k||^2
 cost:
-  # Time penalty weight (penalizes total trajectory duration)
-  a: 1.0
-  
-  # Velocity/path length penalty weight
-  w_L: 1.0
-  
-  # Control effort penalty weight
-  w_E: 1.0
+  a: 1.0          # time penalty (w_T)
+  w_L: 1.0        # path-length penalty
+  w_E: 1.0        # control-effort penalty (w_U)
+  w_u_smooth: 0.5 # inter-segment control smoothness (w_S)
 
-  # Penalize abrupt control changes between neighboring control segments.
-  # Larger values make turns and accelerations smoother, but can increase time.
-  w_u_smooth: 0.5
-
-  # Optional soft heading smoothness term across fixed-path interfaces.
-  w_theta_smooth: 0.0
 # -----------------------------------------------------------------------------
-# Optimizer Configuration
+# Optimizer
 # -----------------------------------------------------------------------------
 optimizer:
-  # Pipeline mode:
-  #   integrated: old one-phase continuous relaxation + fixed-path polish
-  #   two_stage: geometric path ranking + fixed-path NLP screening/final polish
-  pipeline_mode: "integrated"
+  solver_mode: "centroid_refine_dms"
 
-  # Safety limit for graph-path counting in experiment summaries
+  # Upper bound on path enumeration used in experiment summaries.
   max_paths: 1500
 
-  # Enforce u_left(1) = u_right(0) across active region transitions.
-  # This makes the final control profile continuous across interfaces, but
-  # does not by itself eliminate the need for path polish when the integrated
-  # discrete relaxation remains fractional.
-  enforce_control_continuity: false
-  
-  # Solver verbosity/options for the integrated continuous relaxation solve
-  path_polish_candidates: 8
-  max_polish_path_candidates: 20
-  path_screen_top_k: 5
-  path_screen_max_paths: 1500
-  early_stop_on_feasible: true
-  acceptable_dense_tolerance_for_repair: 5.0e-3
-  screening_ipopt_tol: 1.0e-4
-  screening_max_iter: 500
-  final_ipopt_tol: 1.0e-6
-  final_max_iter: 3000
-  repair_enabled: true
-  repair_max_rounds: 2
-  local_shrink_margin: 0.003
-  adaptive_refine_enabled: true
-  # Leave null to use shooting.safety_mode during screening.
-  # Set to "mesh" to make the first pass cheaper and reserve CTCS for final.
-  screening_safety_mode: null
-  final_connection_tolerance: 1.0e-6
-  final_defect_tolerance: 1.0e-6
-  final_integrality_tolerance: 1.0e-6
-  ipopt:
-    max_iter: 3500
-    tol: 1.0e-6
-    print_level: 0  # 0=silent, 5=verbose
-    
-  # Big-M values for on/off constraints
-  big_M:
-    position: 20.0    # for state bounds
-    interface: 20.0   # for coupling constraints
-    time: 100.0       # for time variable bounds
+# -----------------------------------------------------------------------------
+# Centroid-Refine-DMS Solver
+# -----------------------------------------------------------------------------
+# Math reference: docs/superpowers/specs/2026-06-07-centroid-refine-dms-design.md
+# Pipeline:
+#   A. Heuristic graph search  -> ranked candidate paths
+#   B. Interface QP            -> waypoints with safe overlap clearance
+#   C. Centroid warm-start     -> feasible DMS initial guess
+#   D-E. Barrier DMS           -> trajectory with log-barrier safety
+centroid_refine_dms:
+  # Stage A -- graph search heuristic weights
+  gamma_w: 1.0    # interface clearance bonus (same units as length)
+  gamma_h: 0.64   # heading-change penalty (v_nom / omega_max ~= 2.0/pi)
+
+  # Stage B -- Interface QP safety margins
+  # delta_safe is raised at runtime to: max(this, L_s * h_max/2 + epsilon_final)
+  delta_safe: 0.02
+  delta_extra: 0.01
+  alpha_s: 0.0    # QP smoothness weight (0 = pure shortest polyline)
+
+  # Stage C -- warm-start nominal speed
+  v_nom_fraction: 0.5   # v_nom = fraction * v_max
+
+  # Stage D-E -- barrier continuation schedule (large -> small mu)
+  barrier_levels: [1.0, 0.5, 0.1, 0.01, ]
+
+  # Stopping criteria
+  epsilon_final: 1.0e-6   # final IPOPT KKT tolerance
+  epsilon_gap: 0.05        # near-optimality gap for anytime mode
+  # time_limit_s: 60.0
+
+  mode: "anytime"   # "first_feasible" | "anytime"
+
+  # Ablation flags (all true = full proposed method)
+  use_centroid_cost: true
+  use_interface_qp: true
+  use_log_barrier: true
+  use_barrier_continuation: true
+  use_inexact_tolerance: true
 
 # -----------------------------------------------------------------------------
-# Visualization Configuration
+# Visualization
 # -----------------------------------------------------------------------------
 visualization:
-  # Figure size (inches)
   figsize: [10, 10]
-  
-  # Colors
   colors:
     workspace: "#f0f0f0"
     obstacles: "#000000"
-    regions: "tab10"  # colormap name
+    regions: "tab10"
     trajectory: "#2196F3"
     start: "#4CAF50"
     goal: "#F44336"
     interface_points: "#FF9800"
     mesh_points: "#9C27B0"
-  
-  # Whether to show mesh points on trajectory
   show_mesh_points: true
-  
-  # Animation settings
   animation:
     fps: 30
     shooting_fps: 12
-    duration: 5.0  # seconds
+    duration: 5.0
 
 # -----------------------------------------------------------------------------
-# Experiment Scenarios
+# Scenarios
 # -----------------------------------------------------------------------------
+# Overrides are merged on top of the global config via deep-update.
+# CRD-relevant override keys:
+#   overrides.centroid_refine_dms.*          -- solver hyperparameters
+#   overrides.control.n_segments             -- piecewise-constant segments
+#   overrides.shooting.n_integration_steps   -- RK4 steps (affects Lipschitz gap)
+#   overrides.dynamics.delta_max             -- max dwell time per region
+#   overrides.cost.*                         -- cost weights
+#   overrides.region_decomposition.overlap_width
 scenarios:
-  # Scenario-specific parameter changes should go under `overrides`.
-  # Supported examples:
-  #   overrides.shooting.n_mesh_points
-  #   overrides.control.n_segments
-  #   overrides.cost.a
-  #   overrides.optimizer.ipopt.max_iter
-  # You can also override `problem_preset`, `start_state`, and `goal_state`.
-    
   default:
     name: "Default Environment"
-    description: "Default map with hand-crafted convex safe regions"
+    description: "5x5 workspace with 6 obstacles, ACD2D convex decomposition"
     active_regions: "all"
     problem_preset: "default"
     overrides:
+      control:
+        n_segments: 2
       shooting:
-<<<<<<< HEAD
-        n_mesh_points: 5
+        n_integration_steps: 44
+      centroid_refine_dms:
+        delta_safe: 0.07
+        barrier_levels: [1.0, 0.01]
+        mode: "first_feasible"
 
-  simple:
-    name: "Simple Environment"
-    description: "Alias for the default hand-crafted convex-region map"
-    active_regions: "all"
-    problem_preset: "default"
-    overrides:
-      shooting:
-        n_mesh_points: 5
-=======
-        n_mesh_points: 7
->>>>>>> a803b86 (Add comprehensive unit tests for various components)
-    
   maze:
     name: "Maze Environment"
-    description: "Maze map with all active regions"
+    description: "Dense maze obstacle field, ACD2D convex decomposition"
     active_regions: "all"
     problem_preset: "maze"
-    overrides:
-      shooting:
-        # The maze decomposition often creates narrow passages and sliver
-        # interface regions. Three mesh points only checks one interior sample
-        # per region, which is too sparse for curved unicycle trajectories.
-        n_mesh_points: 3
-      control:
-        # Two piecewise-constant segments per region are often too coarse for
-        # the maze ACD decomposition, especially around tiny bridge regions.
-        n_segments: 2
-      optimizer:
-        # Exact control continuity across every region interface makes the
-        # unicycle start turning too early and keep turning too long when the
-        # graph contains narrow/sliver transitions.
-        enforce_control_continuity: false
 
 # -----------------------------------------------------------------------------
-# Output Configuration
+# Output
 # -----------------------------------------------------------------------------
 output:
-  # Directory for results (relative to demo folder)
   results_dir: "results"
-  
-  # File formats
   save_png: true
   save_gif: true
-  save_json: true  # save numeric results
-  
-  # Verbosity level (0=quiet, 1=normal, 2=verbose)
+  save_json: true
   verbosity: 1

@@ -22,10 +22,41 @@ import casadi as ca
 import time
 
 from graph_builder import RegionGraph, SOURCE, TARGET
+from graph_types import region_index_from_node_id, is_terminal_node_id, region_node_label
+from constraint_layers import (
+    merge_constraint_layers,
+    build_fixed_path_geometry_constraints,
+    build_fixed_path_cbf_safety_constraints,
+    build_fixed_path_coupling_constraints,
+    build_fixed_path_boundary_constraints,
+)
 from dynamics import (DynamicsModel, ControlParameterization,
                       create_casadi_integrator, create_casadi_trajectory_sampler,
-                      create_casadi_ctcs_integrator, RK4Integrator)
+                      create_casadi_ctcs_integrator, RK4Integrator,
+                      create_integration_bundle)
 from shooting import create_casadi_local_cost
+
+
+def _tile_control_vector(u: np.ndarray, control_param: "ControlParameterization") -> np.ndarray:
+    """Tile a single per-segment control vector into the full w vector (n_segments copies)."""
+    return np.tile(u, control_param.n_segments)
+
+
+def _state_guess_from_position(
+    dynamics: "DynamicsModel",
+    position: np.ndarray,
+    heading: float,
+    warm: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Build a full state guess: position + heading (unicycle) or zeros for other dims."""
+    if warm is not None:
+        return np.asarray(warm, dtype=float)
+    state = np.zeros(dynamics.n_x, dtype=float)
+    pos_idx = list(dynamics.position_indices)
+    state[pos_idx] = position[: len(pos_idx)]
+    for ang_idx in dynamics.angle_indices:
+        state[ang_idx] = heading
+    return state
 
 
 @dataclass
@@ -43,6 +74,7 @@ class OptimizationConfig:
     n_mesh_points: int = 5
     n_control_segments: int = 2
     safety_margin: float = 0.02
+    cbf_alpha: float = 0.0
     safety_mode: str = "both"
     ctcs_tolerance: float = 1.0e-6
     ctcs_penalty: str = "squared_hinge"
@@ -90,7 +122,37 @@ class OptimizationConfig:
     adaptive_refine_enabled: bool = True
     screening_safety_mode: Optional[str] = None
     local_region_safety_margins: Dict[int, float] = field(default_factory=dict)
-    
+
+
+@dataclass
+class CentroidRefineDMSConfig:
+    """Configuration for the centroid_refine_dms solver."""
+    gamma_w: float = 1.0
+    gamma_h: float = 0.64
+    delta_safe: float = 0.02
+    delta_extra: float = 0.01
+    alpha_s: float = 0.0
+    v_nom_fraction: float = 0.5
+    barrier_levels: List[float] = field(default_factory=lambda: [1.0, 0.5, 0.1, 0.01])
+    epsilon_final: float = 1e-6
+    epsilon_gap: float = 0.05
+    time_limit_s: float = 60.0
+    mode: str = "first_feasible"
+    n_int: int = 10
+    n_control_segments: int = 2
+    delta_min: float = 0.1
+    delta_max: float = 10.0
+    w_T: float = 1.0
+    w_L: float = 1.0
+    w_U: float = 1.0
+    w_S: float = 0.2
+    use_centroid_cost: bool = True
+    use_interface_qp: bool = True
+    use_log_barrier: bool = True
+    use_barrier_continuation: bool = True
+    use_inexact_tolerance: bool = True
+
+
 @dataclass
 class OptimizationResult:
     """Result of optimization."""
@@ -137,6 +199,19 @@ class OptimizationResult:
     repaired_regions: List[int] = field(default_factory=list)
     per_candidate_diagnostics: List[Dict] = field(default_factory=list)
     stage_timings: Dict[str, float] = field(default_factory=dict)
+
+    # Fields for centroid_refine_dms
+    formulation_mode: str = "INTEGRATED_MIOCP"
+    global_optimality_claim: str = ""
+    min_safety_margin: float = float("nan")
+    certified_safety_margin: float = float("nan")
+    lipschitz_gap: float = float("nan")
+    safety_certification: str = "NOT_SET"
+    lb_geometric: float = 0.0
+    optimality_gap: float = float("inf")
+    n_barrier_levels: int = 0
+    failure_log: list = field(default_factory=list)
+    n_nlp_iterations: int = 0
 
 
 def _compute_connection_gap(path_regions: List[int],
@@ -452,6 +527,10 @@ class PathNLPSolver:
             config.n_integration_steps,
             config.n_mesh_points,
         )
+        self.F_endpoint = self.integration_bundle.F_endpoint
+        self.mesh_sampler = self.integration_bundle.mesh_sampler
+        self.cbf_sampler = self.integration_bundle.cbf_sampler
+        self.local_cost_fn = self.integration_bundle.local_cost_fn
         self.ctcs_integrators = {
             region.index: create_casadi_ctcs_integrator(
                 dynamics,
@@ -507,7 +586,8 @@ class PathNLPSolver:
                    warm_start: Optional[Dict[int, Dict[str, np.ndarray | float]]] = None,
                    ipopt_tol: Optional[float] = None,
                    max_iter: Optional[int] = None,
-                   safety_mode: Optional[str] = None
+                   safety_mode: Optional[str] = None,
+                   iteration_recorder=None,
                    ) -> OptimizationResult:
         """
         Solve NLP for a fixed path.
@@ -705,7 +785,7 @@ class PathNLPSolver:
         ctcs_outputs = {}
         for i, region_idx in enumerate(path_regions):
             s_minus = s_minus_list[i]
-            s_plus = s_plus_list[i]
+            s_plus = s_plus_expr_list[i]
             w = w_list[i]
             delta = delta_list[i]
             
@@ -730,17 +810,6 @@ class PathNLPSolver:
         # transitions across shared boundaries stay feasible.
         # -----------------------------------------------------------------
         
-        for i, region_idx in enumerate(path_regions):
-            region = self.graph.regions[region_idx]
-            s_minus = s_minus_list[i]
-            s_plus = s_plus_list[i]
-            w = w_list[i]
-            delta = delta_list[i]
-            
-            A_dm = ca.DM(region.A)
-            b_dm = ca.DM(region.b)
-            boundary_tol = self.config.boundary_tolerance
-
         g, lbg, ubg = merge_constraint_layers([
             build_fixed_path_geometry_constraints(
                 self.graph,
@@ -781,73 +850,10 @@ class PathNLPSolver:
             ),
         ])
 
-            if _uses_mesh_safety(self.config.safety_mode):
-                mesh_positions = self.mesh_sampler(s_minus, w, delta)
-                margin = _region_safety_margin(self.config, region_idx)
-                
-                for k in _interior_mesh_indices(n_mesh):
-                    pos = mesh_positions[k, :]
-                    violation = ca.mtimes(A_dm, pos.T) - b_dm + margin
-                    g.append(violation)
-                    lbg.extend([-np.inf] * len(region.b))
-                    ubg.extend([0.0] * len(region.b))
-
-            if _uses_ctcs_safety(self.config.safety_mode):
-                _, eta_end = ctcs_outputs[i]
-                g.append(eta_end)
-                lbg.append(-np.inf)
-                ubg.append(self.config.ctcs_tolerance)
-        
         # -----------------------------------------------------------------
         # Layer 3: On/off coupling (interface matching)
         # Since path is fixed, enforce: s_u^+ = s_v^- at interfaces
         # -----------------------------------------------------------------
-        
-        for i in range(n_regions - 1):
-            # Coupling between consecutive regions
-            s_plus_curr = s_plus_list[i]
-            s_minus_next = s_minus_list[i + 1]
-            
-            # Continuity: s_u^+ = s_v^-
-            coupling = s_plus_curr - s_minus_next
-            
-            g.append(coupling)
-            lbg.extend([0.0] * n_x)
-            ubg.extend([0.0] * n_x)
-            
-            # Interface membership is enforced by:
-            # 1. endpoint closure of s_u^+ in Q_u
-            # 2. endpoint closure of s_v^- in Q_v
-            # 3. coupling s_u^+ = s_v^-
-            # This works for both overlapping regions and regions that only
-            # touch on a shared boundary.
-
-            if self.config.enforce_control_continuity:
-                u_exit_curr = self.control_param.evaluate_casadi(1.0, w_list[i])
-                u_entry_next = self.control_param.evaluate_casadi(0.0, w_list[i + 1])
-                control_coupling = u_exit_curr - u_entry_next
-
-                g.append(control_coupling)
-                lbg.extend([0.0] * self.dynamics.n_u)
-                ubg.extend([0.0] * self.dynamics.n_u)
-        
-        # -----------------------------------------------------------------
-        # Boundary conditions
-        # -----------------------------------------------------------------
-        
-        # Start: s_0^- position must match start_state position
-        g.append(s_minus_list[0][:2] - start_state[:2])
-        lbg.extend([0.0, 0.0])
-        ubg.extend([0.0, 0.0])
-        
-        # Start heading is left free (robot can orient itself)
-        
-        # Goal: s_N^+ position must match goal_state position
-        g.append(s_plus_list[-1][:2] - goal_state[:2])
-        lbg.extend([0.0, 0.0])
-        ubg.extend([0.0, 0.0])
-        
-        # Goal heading is left free (robot can arrive from any angle)
         
         # Stack constraints
         g = ca.vertcat(*g)
@@ -915,16 +921,18 @@ class PathNLPSolver:
         stats = solver.stats()
         success = bool(stats.get('success', False))
         return_status = stats.get('return_status', 'unknown')
-        
+        n_nlp_iters = int(stats.get('iter_count', 0))
+
         # Parse solution
         result = self._parse_solution(
             x_opt, path_regions, n_x, n_w,
             start_state, goal_state
         )
-        
+
         result.success = success
         result.total_cost = float(sol['f'])
         result.solver_status = return_status
+        result.n_nlp_iterations = n_nlp_iters
         result.constraint_violation = _compute_bound_violation(
             np.array(sol['g']).flatten(),
             lbg,
@@ -2487,16 +2495,283 @@ class IntegratedMIOCPSolver:
         
         return result
 
+
+class CentroidRefineDMSSolver:
+    """
+    Centroid-Refine-DMS solver.
+
+    Stage A: Composite-cost k-shortest-paths graph search.
+    Stage B: Interface QP geometric refinement.
+    Stage C: Centroid warm-start construction.
+    Stage D-E: Barrier-DMS NLP solve with continuation.
+    """
+
+    def __init__(self, graph: RegionGraph, dynamics: DynamicsModel, config: "CentroidRefineDMSConfig"):
+        self.graph = graph
+        self.dynamics = dynamics
+        self.config = config
+
+    def _extract_region_indices(self, path: List[str]) -> List[int]:
+        from graph_types import region_index_from_node_id, is_terminal_node_id
+        return [
+            region_index_from_node_id(n)
+            for n in path
+            if not is_terminal_node_id(n)
+        ]
+
+    def solve(self, start_state: np.ndarray, goal_state: np.ndarray,
+              verbose: bool = False) -> OptimizationResult:
+        import time as _time
+        from graph_builder import add_composite_costs_to_graph, k_shortest_paths_generator, SOURCE, TARGET
+        from geometric_refiner import InterfaceQPConfig, NarrowInterfaceError, solve_interface_refinement
+        from warmstart import WarmStartConfig, build_centroid_warmstart
+        from barrier_dms import BarrierDMSConfig, BarrierDMSSolver
+        from constraint_layers import compute_lipschitz_safety_gap
+
+        cfg = self.config
+        start_clock = _time.time()
+        x_start = start_state[:2]
+        x_goal = goal_state[:2]
+
+        try:
+            centers = add_composite_costs_to_graph(
+                self.graph, start_pos=x_start, goal_pos=x_goal,
+                gamma_w=cfg.gamma_w, gamma_h=cfg.gamma_h,
+            )
+        except Exception as e:
+            return OptimizationResult(
+                success=False, path=[], path_regions=[], total_cost=float('inf'),
+                solve_time=_time.time() - start_clock, n_paths_evaluated=0,
+                solver_status=f"CentroidRefineDMS Stage A failed: {e}",
+                formulation_mode="centroid_refine_dms",
+                safety_mode="log_barrier",
+            )
+
+        best_result: Optional[OptimizationResult] = None
+        n_evaluated = 0
+        failure_log = []
+        _KKT_DISCLAIMER = (
+            "KKT-feasible under LICQ+SOSC; no global optimality certificate."
+        )
+
+        import networkx as _nx
+        if not _nx.has_path(self.graph.graph, SOURCE, TARGET):
+            return OptimizationResult(
+                success=False, path=[], path_regions=[], total_cost=float('inf'),
+                solve_time=_time.time() - start_clock, n_paths_evaluated=0,
+                solver_status="CentroidRefineDMS: graph has no path from source to target",
+                formulation_mode="centroid_refine_dms",
+                safety_mode="log_barrier",
+            )
+
+        gen = k_shortest_paths_generator(self.graph, SOURCE, TARGET)
+
+        for path in gen:
+            if _time.time() - start_clock > cfg.time_limit_s:
+                break
+
+            path_regions = self._extract_region_indices(path)
+            if not path_regions:
+                continue
+
+            n_evaluated += 1
+
+            qp_cfg = InterfaceQPConfig(
+                delta_safe=cfg.delta_safe, delta_extra=cfg.delta_extra, lambda_s=cfg.alpha_s,
+            )
+            ws_cfg = WarmStartConfig(v_nom_fraction=cfg.v_nom_fraction, n_int=cfg.n_int)
+            try:
+                if cfg.use_interface_qp:
+                    z = solve_interface_refinement(self.graph, path_regions, x_start, x_goal, qp_cfg)
+                else:
+                    m = len(path_regions)
+                    z = np.zeros((m + 1, 2))
+                    z[0] = x_start
+                    z[m] = x_goal
+                    for ii in range(1, m):
+                        tau = ii / m
+                        z[ii] = x_start * (1 - tau) + x_goal * tau
+            except NarrowInterfaceError as e:
+                failure_log.append({'path': path, 'stage': 'B', 'reason': str(e)})
+                continue
+            except Exception as e:
+                failure_log.append({'path': path, 'stage': 'B', 'reason': str(e)})
+                continue
+
+            try:
+                warm_start = build_centroid_warmstart(
+                    graph=self.graph, path_regions=path_regions, anchor_points=z,
+                    dynamics=self.dynamics, config=ws_cfg,
+                )
+                delta_safe_barrier = cfg.delta_safe
+                for _ in range(4):
+                    delta_arr = np.array(
+                        [warm_start[ri]['delta'] for ri in path_regions], dtype=float
+                    )
+                    lip_gap = compute_lipschitz_safety_gap(
+                        self.dynamics, path_regions, self.graph, delta_arr, cfg.n_int
+                    )
+                    required_delta_safe = max(
+                        cfg.delta_safe, lip_gap + cfg.epsilon_final
+                    )
+                    if (
+                        not cfg.use_interface_qp
+                        or required_delta_safe <= delta_safe_barrier + 1e-9
+                    ):
+                        delta_safe_barrier = required_delta_safe
+                        break
+
+                    delta_safe_barrier = required_delta_safe
+                    barrier_qp_cfg = InterfaceQPConfig(
+                        delta_safe=delta_safe_barrier,
+                        delta_extra=cfg.delta_extra,
+                        lambda_s=cfg.alpha_s,
+                    )
+                    z = solve_interface_refinement(
+                        self.graph, path_regions, x_start, x_goal, barrier_qp_cfg
+                    )
+                    warm_start = build_centroid_warmstart(
+                        graph=self.graph, path_regions=path_regions, anchor_points=z,
+                        dynamics=self.dynamics, config=ws_cfg,
+                    )
+            except NarrowInterfaceError as e:
+                failure_log.append({'path': path, 'stage': 'B2', 'reason': str(e)})
+                continue
+            except Exception as e:
+                failure_log.append({'path': path, 'stage': 'C', 'reason': str(e)})
+                continue
+
+            barrier_cfg = BarrierDMSConfig(
+                n_int=cfg.n_int, delta_safe=delta_safe_barrier, delta_extra=cfg.delta_extra,
+                barrier_levels=cfg.barrier_levels if cfg.use_barrier_continuation else [cfg.barrier_levels[-1]],
+                epsilon_final=cfg.epsilon_final,
+                time_limit_s=max(1.0, cfg.time_limit_s - (_time.time() - start_clock)),
+                delta_min=cfg.delta_min, delta_max=cfg.delta_max,
+                n_control_segments=cfg.n_control_segments,
+                w_T=cfg.w_T, w_L=cfg.w_L, w_U=cfg.w_U, w_S=cfg.w_S,
+            )
+
+            try:
+                barrier_solver = BarrierDMSSolver(self.graph, self.dynamics, barrier_cfg)
+                barrier_result = barrier_solver.solve(
+                    path_regions, z, warm_start,
+                    start_state=start_state, goal_state=goal_state,
+                )
+            except Exception as e:
+                failure_log.append({'path': path, 'stage': 'DE', 'reason': str(e)})
+                continue
+
+            opt_result = OptimizationResult(
+                success=barrier_result.success, path=path, path_regions=path_regions,
+                total_cost=barrier_result.total_cost, solve_time=_time.time() - start_clock,
+                n_paths_evaluated=n_evaluated, solver_status=barrier_result.solver_status,
+                formulation_mode="centroid_refine_dms",
+                safety_mode="log_barrier",
+                global_optimality_claim=_KKT_DISCLAIMER,
+                min_safety_margin=barrier_result.min_safety_margin,
+                certified_safety_margin=barrier_result.certified_safety_margin,
+                lipschitz_gap=barrier_result.lipschitz_gap,
+                safety_certification=barrier_result.safety_certification,
+                n_barrier_levels=len(barrier_result.barrier_level_results),
+                failure_log=failure_log,
+                entry_states=barrier_result.entry_states,
+                exit_states=barrier_result.exit_states,
+                control_params=barrier_result.control_params,
+                time_durations=barrier_result.time_durations,
+                pipeline_mode="centroid_refine_dms",
+            )
+
+            if barrier_result.success:
+                best_result = opt_result
+                if cfg.mode == "first_feasible":
+                    break
+            elif best_result is None:
+                best_result = opt_result
+
+        if best_result is None:
+            return OptimizationResult(
+                success=False, path=[], path_regions=[], total_cost=float('inf'),
+                solve_time=_time.time() - start_clock, n_paths_evaluated=n_evaluated,
+                solver_status="CentroidRefineDMS: no feasible path found",
+                formulation_mode="centroid_refine_dms", failure_log=failure_log,
+                safety_mode="log_barrier",
+                global_optimality_claim=_KKT_DISCLAIMER,
+            )
+
+        best_result.solve_time = _time.time() - start_clock
+
+        if best_result.success and best_result.entry_states:
+            control_param = ControlParameterization(
+                n_segments=cfg.n_control_segments,
+                n_u=self.dynamics.n_u,
+                parameterization="piecewise_constant",
+            )
+            integrator = RK4Integrator(self.dynamics, control_param, cfg.n_int)
+            for ri in best_result.path_regions:
+                s0 = best_result.entry_states[ri]
+                w = best_result.control_params[ri]
+                delta = best_result.time_durations[ri]
+                traj, tau = integrator.integrate_with_trajectory(s0, w, delta)
+                best_result.trajectories.append((traj, tau, delta))
+            for ri in best_result.path_regions[:-1]:
+                s_exit = best_result.exit_states.get(ri)
+                if s_exit is not None:
+                    best_result.interface_points.append(
+                        self.dynamics.project_to_position(s_exit)
+                        if hasattr(self.dynamics, "project_to_position") else s_exit[:2]
+                    )
+
+        return best_result
+
+
 def create_integrated_optimizer_from_config(graph: RegionGraph,
                                             dynamics: DynamicsModel,
                                             config_dict: Dict) -> IntegratedMIOCPSolver:
     """
     Create the one-phase integrated MIOCP optimizer from configuration.
     """
+    optimizer_cfg = config_dict.get('optimizer', {})
+    solver_type = (optimizer_cfg.get('solver_mode')
+                   or config_dict.get('solver_type', 'integrated'))
+    if solver_type == 'centroid_refine_dms':
+        cr_cfg_dict = config_dict.get('centroid_refine_dms', {})
+        shooting_cfg = config_dict.get('shooting', {})
+        control_cfg = config_dict.get('control', {})
+        dynamics_cfg = config_dict.get('dynamics', {})
+        cost_cfg = config_dict.get('cost', {})
+        cr_config = CentroidRefineDMSConfig(
+            gamma_w=cr_cfg_dict.get('gamma_w', 1.0),
+            gamma_h=cr_cfg_dict.get('gamma_h', 0.64),
+            delta_safe=cr_cfg_dict.get('delta_safe', 0.02),
+            delta_extra=cr_cfg_dict.get('delta_extra', 0.01),
+            alpha_s=cr_cfg_dict.get('alpha_s', 0.0),
+            v_nom_fraction=cr_cfg_dict.get('v_nom_fraction', 0.5),
+            barrier_levels=cr_cfg_dict.get('barrier_levels', [1.0, 0.5, 0.1, 0.01]),
+            epsilon_final=cr_cfg_dict.get('epsilon_final', 1e-6),
+            epsilon_gap=cr_cfg_dict.get('epsilon_gap', 0.05),
+            time_limit_s=cr_cfg_dict.get('time_limit_s', 60.0),
+            mode=cr_cfg_dict.get('mode', 'first_feasible'),
+            n_int=shooting_cfg.get('n_integration_steps', 10),
+            n_control_segments=control_cfg.get('n_segments', 2),
+            delta_min=dynamics_cfg.get('delta_min', 0.1),
+            delta_max=dynamics_cfg.get('delta_max', 10.0),
+            w_T=cost_cfg.get('a', 1.0),
+            w_L=cost_cfg.get('w_L', 1.0),
+            w_U=cost_cfg.get('w_E', 1.0),
+            w_S=cost_cfg.get('w_u_smooth', 0.2),
+            use_centroid_cost=cr_cfg_dict.get('use_centroid_cost', True),
+            use_interface_qp=cr_cfg_dict.get('use_interface_qp', True),
+            use_log_barrier=cr_cfg_dict.get('use_log_barrier', True),
+            use_barrier_continuation=cr_cfg_dict.get('use_barrier_continuation', True),
+            use_inexact_tolerance=cr_cfg_dict.get('use_inexact_tolerance', True),
+        )
+        return CentroidRefineDMSSolver(graph, dynamics, cr_config)
+
     cost_config = config_dict.get('cost', {})
     shooting_config = config_dict.get('shooting', {})
     optimizer_config = config_dict.get('optimizer', {})
     control_config = config_dict.get('control', {})
+    dynamics_config = config_dict.get('dynamics', {})
     pipeline_mode = optimizer_config.get('pipeline_mode', 'integrated')
     default_polish_candidates = 5 if pipeline_mode == 'two_stage' else 20
     
@@ -2522,10 +2797,6 @@ def create_integrated_optimizer_from_config(graph: RegionGraph,
         boundary_tolerance=shooting_config.get('boundary_tolerance', 1e-8),
         delta_min=dynamics_config.get('delta_min', 0.1),
         delta_max=dynamics_config.get('delta_max', 10.0),
-        v_min=dynamics_config.get('v_min', -2.0),
-        v_max=dynamics_config.get('v_max', 2.0),
-        omega_min=dynamics_config.get('omega_min', -np.pi),
-        omega_max=dynamics_config.get('omega_max', np.pi),
         active_delta_min=shooting_config.get(
             'active_delta_min',
             max(dynamics_config.get('delta_min', 0.1), 0.05)

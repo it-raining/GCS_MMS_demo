@@ -87,5 +87,58 @@ class ConstraintLayerTests(unittest.TestCase):
         self.assertEqual(ubg, [0.0, 0.0, 0.0, 0.0])
 
 
+class BarrierLogTermsTests(unittest.TestCase):
+    def _make_setup(self):
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "demo"))
+        from convex_regions import create_regions_from_vertices_list
+        from graph_builder import build_region_graph
+        from dynamics import UnicycleModel
+        import casadi as ca
+        regions = create_regions_from_vertices_list([
+            np.array([[0, 0], [2, 0], [2, 2], [0, 2]], dtype=float),
+        ])
+        graph = build_region_graph(regions, np.array([0.1, 0.1]), np.array([1.9, 1.9]))
+        dynamics = UnicycleModel()
+        return graph, dynamics, ca
+
+    def test_barrier_log_terms_scalar(self) -> None:
+        from constraint_layers import build_barrier_log_terms
+        graph, dynamics, ca = self._make_setup()
+        n_int = 2
+        x_vars = [[ca.MX.sym(f'x_{k}', dynamics.n_x) for k in range(n_int + 1)]]
+        delta_list = [ca.MX.sym('delta_0', 1)]
+        B = build_barrier_log_terms(
+            path_regions=[0],
+            graph=graph,
+            dynamics=dynamics,
+            x_node_vars=x_vars,
+            delta_list=delta_list,
+            n_int=n_int,
+            delta_safe=0.02,
+        )
+        self.assertEqual(B.numel(), 1)
+
+    def test_lipschitz_gap_positive(self) -> None:
+        from constraint_layers import compute_lipschitz_safety_gap
+        from dynamics import UnicycleModel
+        from convex_regions import create_regions_from_vertices_list
+        from graph_builder import build_region_graph
+        regions = create_regions_from_vertices_list([
+            np.array([[0, 0], [2, 0], [2, 2], [0, 2]], dtype=float),
+        ])
+        graph = build_region_graph(regions, np.array([0.1, 0.1]), np.array([1.9, 1.9]))
+        dynamics = UnicycleModel(v_max=2.0)
+        gap = compute_lipschitz_safety_gap(
+            dynamics=dynamics,
+            path_regions=[0],
+            graph=graph,
+            delta_arr=np.array([1.0]),
+            n_int=10,
+        )
+        self.assertGreater(gap, 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
