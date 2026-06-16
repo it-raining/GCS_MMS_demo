@@ -11,7 +11,10 @@ DEMO_DIR = Path(__file__).resolve().parents[1] / "demo"
 sys.path.insert(0, str(DEMO_DIR))
 
 from convex_regions import create_buffered_regions_from_vertices_list, create_regions_from_vertices_list
-from graph_builder import SOURCE, TARGET, build_region_graph
+from graph_builder import (
+    SOURCE, TARGET, build_region_graph,
+    add_composite_costs_to_graph, dijkstra_geometric_length,
+)
 from graph_types import (
     is_region_node_id,
     region_index_from_node_id,
@@ -277,6 +280,20 @@ class KShortestPathsTests(unittest.TestCase):
             except StopIteration:
                 break
         self.assertEqual(len(all_paths), len(set(all_paths)))
+
+
+class DijkstraGeometricLengthTests(unittest.TestCase):
+    def test_returns_pure_euclidean_path_length(self) -> None:
+        graph = two_region_graph()
+        add_composite_costs_to_graph(
+            graph, start_pos=graph.start_pos, goal_pos=graph.goal_pos,
+        )
+        length = dijkstra_geometric_length(graph, SOURCE, TARGET)
+        self.assertGreater(length, 0.0)
+        direct = float(np.linalg.norm(graph.goal_pos - graph.start_pos))
+        # Going through region centroids cannot be shorter than the
+        # straight-line start-to-goal distance.
+        self.assertGreaterEqual(length, direct - 1e-9)
 
 
 if __name__ == "__main__":

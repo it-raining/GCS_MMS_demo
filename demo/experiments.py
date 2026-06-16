@@ -29,6 +29,7 @@ class ExperimentResult:
     
     def summary(self) -> str:
         """Return human-readable summary."""
+        result = self.optimization_result
         lines = [
             "===========================================",
             f"  Scenario: {self.scenario_name}",
@@ -38,30 +39,38 @@ class ExperimentResult:
             f"  Candidate Paths: {self.n_paths}",
             f"  Setup Time: {self.setup_time:.3f} s",
             "",
-            f"  Optimization Status: {'SUCCESS' if self.optimization_result.success else 'FAILED'}",
-            f"  Solver: {self.optimization_result.solver_status}",
-            f"  Total Cost: {self.optimization_result.total_cost:.4f}",
-            f"  Solve Time: {self.optimization_result.solve_time:.3f} s",
-            f"  Paths Evaluated: {self.optimization_result.n_paths_evaluated}",
-            f"  Safety Mode: {self.optimization_result.safety_mode}",
-            f"  Max CTCS Integral: {self.optimization_result.max_continuous_violation_integral:.2e}",
-            f"  Max Dense Region Violation: {self.optimization_result.max_dense_region_violation:.2e}",
+            f"  Optimization Status: {'SUCCESS' if result.success else 'FAILED'}",
+            f"  Solver: {result.solver_status}",
+            f"  Total Cost: {result.total_cost:.4f}",
+            f"  Solve Time: {result.solve_time:.3f} s",
+            f"  Paths Evaluated: {result.n_paths_evaluated}",
+            f"  Safety Mode: {result.safety_mode}",
         ]
-        
-        if self.optimization_result.success:
+        if result.safety_mode == "both":
+            lines.extend([
+                f"  Max CTCS Integral: {result.max_continuous_violation_integral:.2e}",
+                f"  Max Dense Region Violation: {result.max_dense_region_violation:.2e}",
+            ])
+        else:
+            # Spec Sec 8.3: CTCS/dense fields are not populated outside
+            # safety_mode="both" -- "n/a" avoids implying a measured zero.
+            lines.append(f"  Max CTCS Integral: n/a ({result.safety_mode} mode)")
+            lines.append(f"  Max Dense Region Violation: n/a ({result.safety_mode} mode)")
+
+        if result.success:
             lines.extend([
                 "",
-                f"  Path: {' -> '.join(self.optimization_result.path)}",
-                f"  Total Duration: {sum(self.optimization_result.time_durations.values()):.3f} s",
-                f"  Defect Norm: {self.optimization_result.defect_norm:.2e}",
-                f"  Max Connection Gap: {self.optimization_result.max_connection_gap:.2e}",
-                f"  Max Control Jump: {self.optimization_result.max_control_jump:.2e}",
+                f"  Path: {' -> '.join(result.path)}",
+                f"  Total Duration: {sum(result.time_durations.values()):.3f} s",
+                f"  Defect Norm: {result.defect_norm:.2e}",
+                f"  Max Connection Gap: {result.max_connection_gap:.2e}",
+                f"  Max Control Jump: {result.max_control_jump:.2e}",
             ])
-            if self.optimization_result.max_integrality_gap > 0.0:
+            if result.max_integrality_gap > 0.0:
                 lines.append(
-                    f"  Max Integrality Gap: {self.optimization_result.max_integrality_gap:.2e}"
+                    f"  Max Integrality Gap: {result.max_integrality_gap:.2e}"
                 )
-        
+
         return "\n".join(lines)
 
 

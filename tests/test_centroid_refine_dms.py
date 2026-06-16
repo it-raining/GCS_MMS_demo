@@ -115,6 +115,42 @@ class CentroidRefineDMSSolverTests(unittest.TestCase):
         result = solver.solve(x_start, x_goal)
         self.assertIsInstance(result.failure_log, list)
 
+    def test_defect_and_connection_gap_are_measured(self):
+        graph, dynamics, x_start, x_goal = _make_two_region_scenario()
+        cfg = CentroidRefineDMSConfig(
+            n_int=40, barrier_levels=[1.0, 0.5, 0.1, 0.01], time_limit_s=30.0,
+        )
+        solver = CentroidRefineDMSSolver(graph, dynamics, cfg)
+        result = solver.solve(x_start, x_goal)
+        self.assertTrue(result.success)
+        self.assertGreater(result.defect_norm, 0.0)
+        self.assertLess(result.max_connection_gap, 1e-3)
+
+    def test_global_optimality_claim_matches_mandatory_disclaimer(self):
+        graph, dynamics, x_start, x_goal = _make_two_region_scenario()
+        cfg = CentroidRefineDMSConfig(n_int=8, epsilon_final=1e-3)
+        solver = CentroidRefineDMSSolver(graph, dynamics, cfg)
+        result = solver.solve(x_start, x_goal)
+        expected = (
+            "LB is a geometric lower bound on the time component only. "
+            "gap_k is NOT a certificate for the full DMS objective. "
+            "No global optimality claim is made. The reported solution is a "
+            "KKT point of the fixed-path barrier-augmented NLP under LICQ + SOSC."
+        )
+        self.assertEqual(result.global_optimality_claim, expected)
+
+    def test_lower_bound_and_optimality_gap_are_populated(self):
+        graph, dynamics, x_start, x_goal = _make_two_region_scenario()
+        cfg = CentroidRefineDMSConfig(
+            n_int=40, barrier_levels=[1.0, 0.5, 0.1, 0.01], time_limit_s=30.0,
+        )
+        solver = CentroidRefineDMSSolver(graph, dynamics, cfg)
+        result = solver.solve(x_start, x_goal)
+        self.assertTrue(result.success)
+        self.assertGreater(result.lb_geometric, 0.0)
+        self.assertTrue(np.isfinite(result.optimality_gap))
+        self.assertGreaterEqual(result.optimality_gap, 0.0)
+
     def test_solver_mode_dispatch(self):
         from optimizer import create_integrated_optimizer_from_config, CentroidRefineDMSSolver
         graph, dynamics, x_start, x_goal = _make_two_region_scenario()

@@ -40,6 +40,8 @@ class BarrierPathResult:
     certified_safety_margin: float = float('nan')
     lipschitz_gap: float = float('nan')
     safety_certification: str = "NOT_SET"
+    defect_norm: float = float('nan')
+    n_nlp_iterations: int = 0
     entry_states: Dict[int, np.ndarray] = field(default_factory=dict)
     exit_states: Dict[int, np.ndarray] = field(default_factory=dict)
     control_params: Dict[int, np.ndarray] = field(default_factory=dict)
@@ -77,6 +79,12 @@ class BarrierDMSSolver:
             warm_start[ri]['delta'] if (warm_start and ri in warm_start) else 1.0
             for ri in path_regions
         ], dtype=float)
+        # Clamp to delta_max (Part 2.4 variable bound): Delta_i can never
+        # exceed delta_max once solved, so h_max (R13/Part 8.2) must reflect
+        # that bound, not an unclamped warm-start estimate (Part 4.1 defines
+        # Delta_i^0 with no upper clamp), which can otherwise re-inflate
+        # delta_safe here past what the caller already converged on.
+        delta_arr = np.minimum(delta_arr, cfg.delta_max)
         lip_gap = compute_lipschitz_safety_gap(self.dynamics, path_regions, self.graph, delta_arr, cfg.n_int)
         delta_safe = max(cfg.delta_safe, lip_gap + cfg.epsilon_final)
         node_delta_safe = np.full(
@@ -86,6 +94,7 @@ class BarrierDMSSolver:
         best_result = None
         level_results = []
         x_init = None
+        total_n_iter = 0
 
         self._log_warm_start_slacks(
             path_regions, anchor_points, node_delta_safe, delta_arr
@@ -109,11 +118,15 @@ class BarrierDMSSolver:
                     goal_state=goal_state,
                     node_delta_safe=node_delta_safe,
                 )
-                level_results.append({'mu': mu, 'success': result.success, 'cost': result.total_cost})
+                total_n_iter += result.n_nlp_iterations
+                level_results.append({
+                    'mu': mu, 'success': result.success, 'cost': result.total_cost,
+                    'n_iter': result.n_nlp_iterations,
+                })
                 if result.success:
                     best_result = result
             except Exception as e:
-                level_results.append({'mu': mu, 'success': False, 'error': str(e)})
+                level_results.append({'mu': mu, 'success': False, 'error': str(e), 'n_iter': 0})
 
         solve_time = time.time() - start_time
 
@@ -127,7 +140,7 @@ class BarrierDMSSolver:
         best_result.solve_time = solve_time
         best_result.barrier_level_results = level_results
 
-        min_slack = self._compute_min_slack(best_result)
+        min_slack = self._compute_min_slack(best_result, delta_safe)
         optimized_delta_arr = np.array(
             [best_result.time_durations[ri] for ri in path_regions], dtype=float
         )
@@ -135,12 +148,21 @@ class BarrierDMSSolver:
             self.dynamics, path_regions, self.graph,
             optimized_delta_arr, cfg.n_int,
         )
+        # Spec Sec 8.2: s_min_certified = s_min_sampled - L_s*h_max/2
+        #                                 - epsilon_defect - epsilon_int.
+        h_max = float(np.max(optimized_delta_arr)) / cfg.n_int
+        defect_norm = self._compute_defect_norm(best_result, start_state, goal_state)
+        eps_int = self.dynamics.f_lipschitz_bound() * (h_max ** 4) / 30.0
+        best_result.defect_norm = defect_norm
         best_result.lipschitz_gap = lip_gap
         best_result.min_safety_margin = float(min_slack)
-        best_result.certified_safety_margin = float(min_slack - lip_gap)
+        best_result.certified_safety_margin = float(
+            min_slack - lip_gap - defect_norm - eps_int
+        )
         best_result.safety_certification = (
             "CERTIFIED" if best_result.certified_safety_margin > 0 else "NOT_CERTIFIED"
         )
+        best_result.n_nlp_iterations = total_n_iter
         final_level = cfg.barrier_levels[-1]
         final_level_succeeded = bool(
             level_results
@@ -257,7 +279,8 @@ class BarrierDMSSolver:
         g_list = []
         lbg = []
         ubg = []
-        obj = ca.MX(0.0)
+        obj_base = ca.MX(0.0)
+        barrier_term = ca.MX(0.0)
 
         for i in range(m):
             s_m = s_minus_vars[i]
@@ -271,8 +294,8 @@ class BarrierDMSSolver:
                 u_k = self.control_param.evaluate_casadi(tau, w_v)
                 h_k = dv / (2.0 * cfg.n_int) if k == 0 else dv / cfg.n_int
                 vel_k = self.dynamics.position_velocity_casadi(x_k, u_k)
-                obj = (
-                    obj
+                obj_base = (
+                    obj_base
                     + h_k * cfg.w_L * ca.dot(vel_k, vel_k)
                     + h_k * cfg.w_U * ca.dot(u_k, u_k)
                 )
@@ -288,14 +311,14 @@ class BarrierDMSSolver:
             u_end = self.control_param.evaluate_casadi(1.0, w_v)
             vel_end = self.dynamics.position_velocity_casadi(x_k, u_end)
             h_end = dv / (2.0 * cfg.n_int)
-            obj = (
-                obj
+            obj_base = (
+                obj_base
                 + h_end * cfg.w_L * ca.dot(vel_end, vel_end)
                 + h_end * cfg.w_U * ca.dot(u_end, u_end)
             )
             x_node_vars_list.append(traj)
             s_plus = traj[-1]
-            obj = obj + cfg.w_T * dv
+            obj_base = obj_base + cfg.w_T * dv
 
             for control_idx in range(self.control_param.n_segments - 1):
                 start = control_idx * self.dynamics.n_u
@@ -303,7 +326,7 @@ class BarrierDMSSolver:
                 u_right = w_v[
                     start + self.dynamics.n_u:start + 2 * self.dynamics.n_u
                 ]
-                obj = obj + cfg.w_S * ca.dot(u_right - u_left, u_right - u_left)
+                obj_base = obj_base + cfg.w_S * ca.dot(u_right - u_left, u_right - u_left)
 
             if i < m - 1:
                 s_minus_next = s_minus_vars[i + 1]
@@ -316,7 +339,7 @@ class BarrierDMSSolver:
                     0.0, w_vars[i + 1]
                 )
                 control_jump = u_entry_next - u_exit
-                obj = obj + cfg.w_S * ca.dot(control_jump, control_jump)
+                obj_base = obj_base + cfg.w_S * ca.dot(control_jump, control_jump)
 
         boundary_start = np.zeros(n_x, dtype=float)
         boundary_goal = np.zeros(n_x, dtype=float)
@@ -384,22 +407,22 @@ class BarrierDMSSolver:
                     if k in (0, cfg.n_int)
                     else delta_i / cfg.n_int
                 )
-                obj = (
-                    obj
+                barrier_term = (
+                    barrier_term
                     - mu * cfg.mu_weight * h_k * ca.sum1(ca.log(slack))
                 )
 
         x_sym = ca.vertcat(*x_sym_list)
         g_sym = ca.vertcat(*g_list) if g_list else ca.MX(0, 1)
 
-        return (x_sym, obj, g_sym, lbx, ubx, lbg, ubg, x0_list,
+        return (x_sym, obj_base, barrier_term, g_sym, lbx, ubx, lbg, ubg, x0_list,
                 s_minus_vars, w_vars, delta_vars, x_node_vars_list)
 
     def _solve_barrier_level(self, path_regions, anchor_points, warm_start,
                               delta_safe, mu, x_init, tol,
                               start_state=None, goal_state=None,
                               node_delta_safe=None):
-        (x_sym, obj, g_sym, lbx, ubx, lbg, ubg,
+        (x_sym, obj_base, barrier_term, g_sym, lbx, ubx, lbg, ubg,
          x0_default, s_minus_vars, w_vars, delta_vars, x_node_vars_list) = self._build_nlp_symbols(
             path_regions, anchor_points, delta_safe, mu,
             start_state=start_state, goal_state=goal_state,
@@ -416,7 +439,7 @@ class BarrierDMSSolver:
         else:
             max_iter = 150
 
-        nlp = {'x': x_sym, 'f': obj, 'g': g_sym}
+        nlp = {'x': x_sym, 'f': obj_base + barrier_term, 'g': g_sym}
         opts = {
             'ipopt.max_iter': max_iter, 'ipopt.tol': tol,
             'ipopt.print_level': 0, 'print_time': 0,
@@ -427,14 +450,19 @@ class BarrierDMSSolver:
         success = bool(stats.get('success', False))
         x_opt = np.array(sol['x']).flatten()
 
+        # Spec Sec 7.2 / Part 9 Stage F: UB must be J|mu=0 (no barrier term).
+        base_cost_fn = ca.Function('barrier_dms_base_cost', [x_sym], [obj_base])
+        total_cost = float(base_cost_fn(x_opt))
+
         m = len(path_regions)
         n_x = self.dynamics.n_x
         n_w = self.control_param.n_w
         vars_per_seg = n_x + n_w + 1
 
         result = BarrierPathResult(
-            success=success, path_regions=path_regions, total_cost=float(sol['f']),
+            success=success, path_regions=path_regions, total_cost=total_cost,
             solve_time=0.0, solver_status=stats.get('return_status', 'unknown'),
+            n_nlp_iterations=int(stats.get('iter_count', 0)),
         )
 
         for i, region_idx in enumerate(path_regions):
@@ -451,7 +479,7 @@ class BarrierDMSSolver:
 
         return result, x_opt
 
-    def _compute_min_slack(self, result: BarrierPathResult) -> float:
+    def _compute_min_slack(self, result: BarrierPathResult, delta_safe: float) -> float:
         min_slack = float('inf')
         for seg_idx, region_idx in enumerate(result.path_regions):
             if (
@@ -468,7 +496,8 @@ class BarrierDMSSolver:
 
             for k in range(self.config.n_int + 1):
                 pos = self.dynamics.project_to_position(x_k)
-                slacks = region.b - region.A @ pos
+                # Spec Sec 2.1/8.1: s_ijk = b - delta_safe - A @ pos.
+                slacks = region.b - delta_safe - region.A @ pos
                 min_slack = min(min_slack, float(np.min(slacks)))
                 if k == self.config.n_int:
                     break
@@ -483,3 +512,42 @@ class BarrierDMSSolver:
                 k4 = delta * self.dynamics.f(x_k + dt * k3, u_end)
                 x_k = x_k + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
         return min_slack if np.isfinite(min_slack) else float('nan')
+
+    def _compute_defect_norm(
+        self,
+        result: BarrierPathResult,
+        start_state: Optional[np.ndarray],
+        goal_state: Optional[np.ndarray],
+    ) -> float:
+        """
+        Inf-norm of the coupling + boundary residuals at the NLP solution
+        (spec Sec 6 Tier 1 / Part 9 Stage F: defect_norm, coupling_gap).
+        These are hard equalities inside the NLP (R1) -- this only measures
+        the residual at the reported solution, it does not change them.
+        """
+        path_regions = result.path_regions
+        if not path_regions:
+            return 0.0
+
+        gaps = []
+        if start_state is not None and path_regions[0] in result.entry_states:
+            gaps.append(
+                float(np.max(np.abs(
+                    result.entry_states[path_regions[0]] - np.asarray(start_state, dtype=float)
+                )))
+            )
+        if goal_state is not None and path_regions[-1] in result.exit_states:
+            gaps.append(
+                float(np.max(np.abs(
+                    result.exit_states[path_regions[-1]] - np.asarray(goal_state, dtype=float)
+                )))
+            )
+        for left_region, right_region in zip(path_regions[:-1], path_regions[1:]):
+            if left_region in result.exit_states and right_region in result.entry_states:
+                gaps.append(
+                    float(np.max(np.abs(
+                        result.exit_states[left_region] - result.entry_states[right_region]
+                    )))
+                )
+
+        return float(max(gaps)) if gaps else 0.0

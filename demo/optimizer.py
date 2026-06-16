@@ -2522,7 +2522,10 @@ class CentroidRefineDMSSolver:
     def solve(self, start_state: np.ndarray, goal_state: np.ndarray,
               verbose: bool = False) -> OptimizationResult:
         import time as _time
-        from graph_builder import add_composite_costs_to_graph, k_shortest_paths_generator, SOURCE, TARGET
+        from graph_builder import (
+            add_composite_costs_to_graph, k_shortest_paths_generator,
+            dijkstra_geometric_length, SOURCE, TARGET,
+        )
         from geometric_refiner import InterfaceQPConfig, NarrowInterfaceError, solve_interface_refinement
         from warmstart import WarmStartConfig, build_centroid_warmstart
         from barrier_dms import BarrierDMSConfig, BarrierDMSSolver
@@ -2551,7 +2554,10 @@ class CentroidRefineDMSSolver:
         n_evaluated = 0
         failure_log = []
         _KKT_DISCLAIMER = (
-            "KKT-feasible under LICQ+SOSC; no global optimality certificate."
+            "LB is a geometric lower bound on the time component only. "
+            "gap_k is NOT a certificate for the full DMS objective. "
+            "No global optimality claim is made. The reported solution is a "
+            "KKT point of the fixed-path barrier-augmented NLP under LICQ + SOSC."
         )
 
         import networkx as _nx
@@ -2563,6 +2569,11 @@ class CentroidRefineDMSSolver:
                 formulation_mode="centroid_refine_dms",
                 safety_mode="log_barrier",
             )
+
+        # Spec Sec 7.1: LB_geom = D*_path / v_max, pure-geometry Dijkstra on
+        # the centroid graph -- computed once, independent of path candidate.
+        d_star = dijkstra_geometric_length(self.graph, SOURCE, TARGET)
+        lb_geometric = d_star / self.dynamics.v_max
 
         gen = k_shortest_paths_generator(self.graph, SOURCE, TARGET)
 
@@ -2605,9 +2616,19 @@ class CentroidRefineDMSSolver:
                 )
                 delta_safe_barrier = cfg.delta_safe
                 for _ in range(4):
+                    # Clamp to delta_max: the NLP variable bound (Part 2.4)
+                    # means Delta_i can never exceed delta_max once solved (see
+                    # the x0 clamp a few lines below), so the safety-gap
+                    # pre-check (R13/Part 8.2's h_max) must use the same bound
+                    # -- not the raw, unclamped warm-start estimate, which can
+                    # be arbitrarily large for elongated regions (Part 4.1
+                    # defines Delta_i^0 with no upper clamp) and would
+                    # otherwise inflate delta_safe far past what the solve
+                    # will actually need.
                     delta_arr = np.array(
                         [warm_start[ri]['delta'] for ri in path_regions], dtype=float
                     )
+                    delta_arr = np.minimum(delta_arr, cfg.delta_max)
                     lip_gap = compute_lipschitz_safety_gap(
                         self.dynamics, path_regions, self.graph, delta_arr, cfg.n_int
                     )
@@ -2679,6 +2700,12 @@ class CentroidRefineDMSSolver:
                 control_params=barrier_result.control_params,
                 time_durations=barrier_result.time_durations,
                 pipeline_mode="centroid_refine_dms",
+                defect_norm=barrier_result.defect_norm,
+                max_connection_gap=_compute_connection_gap(
+                    path_regions, barrier_result.entry_states, barrier_result.exit_states,
+                    start_state, goal_state,
+                ),
+                n_nlp_iterations=barrier_result.n_nlp_iterations,
             )
 
             if barrier_result.success:
@@ -2696,6 +2723,7 @@ class CentroidRefineDMSSolver:
                 formulation_mode="centroid_refine_dms", failure_log=failure_log,
                 safety_mode="log_barrier",
                 global_optimality_claim=_KKT_DISCLAIMER,
+                lb_geometric=lb_geometric,
             )
 
         best_result.solve_time = _time.time() - start_clock
@@ -2720,6 +2748,11 @@ class CentroidRefineDMSSolver:
                         self.dynamics.project_to_position(s_exit)
                         if hasattr(self.dynamics, "project_to_position") else s_exit[:2]
                     )
+
+        # Spec Sec 7.1/7.2 + Part 9 post-processing.
+        best_result.lb_geometric = lb_geometric
+        denom = max(1.0, abs(best_result.total_cost))
+        best_result.optimality_gap = (best_result.total_cost - cfg.w_T * lb_geometric) / denom
 
         return best_result
 

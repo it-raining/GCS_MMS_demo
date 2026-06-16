@@ -79,6 +79,9 @@ def add_composite_costs_to_graph(
         rho_interface = interface_radii.get((u, v), 0.0)
         cost = dist - gamma_w * rho_interface
         data['composite_cost'] = max(cost, 1e-9)
+        # Pure-geometry weight for the Sec 7.1 lower bound -- no
+        # composite-cost interface-radius credit.
+        data['geom_dist'] = dist
 
     return centers
 
@@ -91,6 +94,19 @@ def k_shortest_paths_generator(
 ):
     """Generator yielding simple paths in non-decreasing composite cost (Yen's algorithm)."""
     return nx.shortest_simple_paths(graph.graph, source, target, weight=weight)
+
+
+def dijkstra_geometric_length(
+    graph: "RegionGraph",
+    source: str,
+    target: str,
+) -> float:
+    """
+    Pure-geometry shortest path length on the centroid graph (spec Sec 7.1).
+    Requires add_composite_costs_to_graph() to have been called first so
+    edges carry the 'geom_dist' attribute.
+    """
+    return float(nx.shortest_path_length(graph.graph, source, target, weight='geom_dist'))
 
 
 @dataclass

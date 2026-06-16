@@ -166,8 +166,8 @@ scenarios:
       shooting:
         n_integration_steps: 44
       centroid_refine_dms:
-        delta_safe: 0.07
-        barrier_levels: [1.0, 0.01]
+        delta_safe: 0.03
+        barrier_levels: [0.1]
         mode: "first_feasible"
 
   maze:
@@ -175,6 +175,41 @@ scenarios:
     description: "Dense maze obstacle field, ACD2D convex decomposition"
     active_regions: "all"
     problem_preset: "maze"
+    overrides:
+      # Dense maze regions are small (~0.15-0.3 units across) and many
+      # interfaces have Chebyshev radius as low as 0.13. The global
+      # n_integration_steps=10 / delta_max=3.0 give h_max=0.3, which under
+      # R13 (delta_safe >= L_s*h_max/2 + eps) auto-raises delta_safe to
+      # ~0.30 -- larger than nearly every interface in the maze, so the
+      # Interface QP narrow-interface check (Part 3.4) rejects almost all
+      # candidate paths. h_max = delta_max/n_int, so shrinking delta_max
+      # (keeping n_int at the default 10, to avoid blowing up the NLP size
+      # for 30+ region maze paths) brings h_max to ~0.04, keeping required
+      # delta_safe (~0.05 incl. delta_extra) below all but a dozen
+      # genuinely narrow interfaces.
+      dynamics:
+        delta_max: 0.4
+      centroid_refine_dms:
+        mode: "first_feasible"
+        time_limit_s: 120.0
+        # Default gamma_w=1.0 barely penalizes narrow interfaces, so Yen's
+        # k-shortest search (Stage A, Part 3.3) exhausts hundreds of
+        # cheap-but-narrow variants of the same corridor before trying a
+        # genuinely wide one -- confirmed by 128 evaluated candidates all
+        # sharing the same node prefix/suffix, none reaching Stage D-E.
+        # The maze is still connected after removing every edge with
+        # Chebyshev radius < 0.10 (same 34-node shortest path length), so a
+        # clear route exists; raising gamma_w (Part 3.2 composite edge cost)
+        # ranks it higher in the search order.
+        gamma_w: 8.0
+        # Small headroom above the QP-guaranteed margin: the osqp/qpsol
+        # interface QP satisfies its delta_safe+delta_extra constraint only
+        # to solver tolerance (observed shortfall ~0.0015-0.002 regardless
+        # of delta_extra, consistent with a fixed numerical tolerance
+        # floor rather than a proportional effect), so the R3
+        # strict-interior check at the exact interface node can come up a
+        # hair short. 0.04 leaves clear headroom above that floor.
+        delta_extra: 0.05
 
 # -----------------------------------------------------------------------------
 # Output

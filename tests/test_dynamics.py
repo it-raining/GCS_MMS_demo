@@ -144,5 +144,16 @@ class LipschitzBoundTests(unittest.TestCase):
         self.assertAlmostEqual(dyn.compute_lipschitz_bound([A]), 2.0)
 
 
+class FLipschitzBoundTests(unittest.TestCase):
+    def test_unicycle_bound_equals_v_max(self) -> None:
+        dynamics = UnicycleModel(v_max=3.5)
+        self.assertEqual(dynamics.f_lipschitz_bound(), 3.5)
+
+    def test_double_integrator_bound_is_one(self) -> None:
+        from dynamics import DoubleIntegratorDynamics
+        dynamics = DoubleIntegratorDynamics(v_max=3.5, a_max=1.0)
+        self.assertEqual(dynamics.f_lipschitz_bound(), 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()

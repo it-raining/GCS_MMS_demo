@@ -3,6 +3,7 @@ import sys
 import unittest
 from pathlib import Path
 import numpy as np
+import casadi as ca
 
 DEMO_DIR = Path(__file__).resolve().parents[1] / "demo"
 sys.path.insert(0, str(DEMO_DIR))
@@ -11,6 +12,7 @@ from convex_regions import create_regions_from_vertices_list
 from graph_builder import build_region_graph
 from dynamics import UnicycleModel
 from barrier_dms import BarrierDMSConfig, BarrierDMSSolver, BarrierPathResult
+from constraint_layers import compute_lipschitz_safety_gap
 
 
 def _two_region_setup():
@@ -59,6 +61,21 @@ class BarrierDMSSolverTests(unittest.TestCase):
         result = solver.solve([0, 1], anchor_points)
         self.assertGreater(len(result.barrier_level_results), 0)
 
+    def test_compute_min_slack_subtracts_delta_safe(self) -> None:
+        graph, dynamics = _two_region_setup()
+        cfg = BarrierDMSConfig(n_int=5, barrier_levels=[1.0])
+        solver = BarrierDMSSolver(graph, dynamics, cfg)
+        result = BarrierPathResult(
+            success=True, path_regions=[0], total_cost=0.0, solve_time=0.0,
+            solver_status="ok",
+            entry_states={0: np.array([0.5, 0.5, 0.0])},
+            control_params={0: np.zeros(dynamics.n_u * solver.control_param.n_segments)},
+            time_durations={0: 1.0},
+        )
+        slack_with_margin = solver._compute_min_slack(result, delta_safe=0.05)
+        slack_without_margin = solver._compute_min_slack(result, delta_safe=0.0)
+        self.assertAlmostEqual(slack_without_margin - slack_with_margin, 0.05, places=9)
+
     def test_solved_segments_populate_exit_states(self) -> None:
         graph, dynamics = _two_region_setup()
         cfg = BarrierDMSConfig(n_int=20, barrier_levels=[1.0], time_limit_s=30.0)
@@ -69,6 +86,99 @@ class BarrierDMSSolverTests(unittest.TestCase):
         self.assertEqual(set(result.exit_states), set(result.entry_states))
         for state in result.exit_states.values():
             self.assertEqual(state.shape, (dynamics.n_x,))
+
+    def test_defect_norm_is_small_and_positive(self) -> None:
+        graph, dynamics = _two_region_setup()
+        cfg = BarrierDMSConfig(
+            n_int=40, barrier_levels=[1.0, 0.5, 0.1, 0.01], time_limit_s=30.0,
+        )
+        solver = BarrierDMSSolver(graph, dynamics, cfg)
+        anchor_points = np.array([[0.1, 0.5], [1.0, 0.5], [1.9, 0.5]])
+        result = solver.solve(
+            [0, 1], anchor_points,
+            start_state=np.array([0.1, 0.5, 0.0]),
+            goal_state=np.array([1.9, 0.5, 0.0]),
+        )
+        self.assertTrue(result.success)
+        self.assertGreater(result.defect_norm, 0.0)
+        self.assertLess(result.defect_norm, cfg.epsilon_final * 10)
+
+    def test_build_nlp_symbols_splits_barrier_from_base_cost(self) -> None:
+        graph, dynamics = _two_region_setup()
+        cfg = BarrierDMSConfig(n_int=20, barrier_levels=[1.0])
+        solver = BarrierDMSSolver(graph, dynamics, cfg)
+        anchor_points = np.array([[0.1, 0.5], [1.0, 0.5], [1.9, 0.5]])
+        delta_arr = np.array([1.0, 1.0])
+        lip_gap = compute_lipschitz_safety_gap(dynamics, [0, 1], graph, delta_arr, cfg.n_int)
+        delta_safe = max(cfg.delta_safe, lip_gap + cfg.epsilon_final)
+        node_delta_safe = np.full((2, cfg.n_int + 1), delta_safe)
+
+        mu = 1.0
+        out1 = solver._build_nlp_symbols(
+            [0, 1], anchor_points, delta_safe, mu, node_delta_safe=node_delta_safe,
+        )
+        x_sym, obj_base, barrier_term = out1[0], out1[1], out1[2]
+        x0 = out1[8]
+
+        out2 = solver._build_nlp_symbols(
+            [0, 1], anchor_points, delta_safe, 2 * mu, node_delta_safe=node_delta_safe,
+        )
+        x_sym2, obj_base2, barrier_term2 = out2[0], out2[1], out2[2]
+        x0_2 = out2[8]
+
+        base_fn = ca.Function('base', [x_sym], [obj_base])
+        barrier_fn = ca.Function('barrier', [x_sym], [barrier_term])
+        base_fn2 = ca.Function('base2', [x_sym2], [obj_base2])
+        barrier_fn2 = ca.Function('barrier2', [x_sym2], [barrier_term2])
+
+        base_val = float(base_fn(x0))
+        barrier_val = float(barrier_fn(x0))
+
+        self.assertNotEqual(barrier_val, 0.0)
+        # obj_base must not depend on mu; barrier_term must scale linearly with mu.
+        # (Both calls use the same anchor_points/delta_safe/node_delta_safe, so
+        # x0 == x0_2 and the fresh CasADi symbols line up positionally.)
+        self.assertAlmostEqual(float(base_fn2(x0_2)), base_val, places=8)
+        self.assertAlmostEqual(float(barrier_fn2(x0_2)), 2 * barrier_val, places=8)
+
+    def test_n_nlp_iterations_recorded(self) -> None:
+        graph, dynamics = _two_region_setup()
+        cfg = BarrierDMSConfig(
+            n_int=40, barrier_levels=[1.0, 0.5, 0.1, 0.01], time_limit_s=30.0,
+        )
+        solver = BarrierDMSSolver(graph, dynamics, cfg)
+        anchor_points = np.array([[0.1, 0.5], [1.0, 0.5], [1.9, 0.5]])
+        result = solver.solve(
+            [0, 1], anchor_points,
+            start_state=np.array([0.1, 0.5, 0.0]),
+            goal_state=np.array([1.9, 0.5, 0.0]),
+        )
+        self.assertTrue(result.success)
+        # 4 barrier levels run; n_nlp_iterations must be the sum across all
+        # of them, not just the final (winning) level's iteration count.
+        self.assertEqual(len(result.barrier_level_results), len(cfg.barrier_levels))
+        self.assertEqual(
+            result.n_nlp_iterations,
+            sum(lr['n_iter'] for lr in result.barrier_level_results),
+        )
+
+    def test_certified_margin_accounts_for_defect_and_integration_error(self) -> None:
+        graph, dynamics = _two_region_setup()
+        cfg = BarrierDMSConfig(
+            n_int=40, barrier_levels=[1.0, 0.5, 0.1, 0.01], time_limit_s=30.0,
+        )
+        solver = BarrierDMSSolver(graph, dynamics, cfg)
+        anchor_points = np.array([[0.1, 0.5], [1.0, 0.5], [1.9, 0.5]])
+        result = solver.solve(
+            [0, 1], anchor_points,
+            start_state=np.array([0.1, 0.5, 0.0]),
+            goal_state=np.array([1.9, 0.5, 0.0]),
+        )
+        self.assertTrue(result.success)
+        self.assertLessEqual(
+            result.certified_safety_margin,
+            result.min_safety_margin - result.lipschitz_gap,
+        )
 
 
 if __name__ == "__main__":

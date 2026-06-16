@@ -132,6 +132,15 @@ class DynamicsModel(ABC):
         """
         pass
 
+    @abstractmethod
+    def f_lipschitz_bound(self) -> float:
+        """
+        Lipschitz bound L_f on f(x, u) with respect to x, used for the RK4
+        truncation-error term in the safety certificate
+        (design spec Sec 8.2: epsilon_int ~ L_f * h_max^4 / 30).
+        """
+        pass
+
 
 @dataclass
 class UnicycleModel(DynamicsModel):
@@ -280,6 +289,10 @@ class UnicycleModel(DynamicsModel):
         )
         return max_normal * self.v_max
 
+    def f_lipschitz_bound(self) -> float:
+        """d/dtheta[v cos theta, v sin theta] has norm <= v_max (Sec 8.2)."""
+        return self.v_max
+
 
 @dataclass
 class DoubleIntegratorDynamics(DynamicsModel):
@@ -343,6 +356,10 @@ class DoubleIntegratorDynamics(DynamicsModel):
             for j in range(A.shape[0])
         )
         return max_normal * self.v_max
+
+    def f_lipschitz_bound(self) -> float:
+        """f is linear in x; the velocity-to-position Jacobian block has unit norm."""
+        return 1.0
 
 
 class ControlParameterization:
