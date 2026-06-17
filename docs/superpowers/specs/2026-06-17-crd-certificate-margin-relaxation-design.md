@@ -107,8 +107,28 @@ redundant external subtraction:
 # old: certified = min_slack - lip_gap - defect_norm - eps_int
 #      (double-counts once margin_i already embeds lip_gap/eps_int)
 # new:
-certified_safety_margin = min_slack_full - cfg.delta_extra - cfg.epsilon_certificate_buffer - defect_norm
+certified_safety_margin = min_slack_full - defect_norm
 ```
+
+**Correction (post-implementation, found via the `default` scenario still
+reporting `NOT_CERTIFIED` after raising `epsilon_certificate_buffer`):** the
+formula above must NOT also subtract `delta_extra +
+epsilon_certificate_buffer` from `min_slack_full`. Point 2's hard floor
+already guarantees `min_slack_full >= delta_extra +
+epsilon_certificate_buffer` by construction (it's the same quantity, lower-
+bounded by the NLP's slack `lbx`) — subtracting that exact floor a second
+time here always collapses the result to `~ -defect_norm` whenever the
+floor is the active/binding constraint, which is the common case for any
+genuinely narrow corridor (confirmed empirically: raising
+`epsilon_certificate_buffer` from `0.0` to `0.001` on the `default`
+scenario moved `min_safety_margin` from `0.0100` to `0.0110` in lockstep
+with the floor, while `certified_safety_margin` stayed `~0` in both cases).
+The correct formula subtracts only the hard-equality residual
+(`defect_norm`), which is the only correction `min_slack_full` does not
+already account for; this still satisfies the guarantee in point 2
+(`certified_safety_margin >= delta_extra + epsilon_certificate_buffer -
+defect_norm`) because `min_slack_full` itself is already `>= delta_extra +
+epsilon_certificate_buffer`.
 
 `lipschitz_gap` and the path-wide `eps_int` are still computed and reported
 on `BarrierPathResult` for diagnostics and existing report formatting — they

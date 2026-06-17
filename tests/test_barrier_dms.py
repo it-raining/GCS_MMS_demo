@@ -221,14 +221,52 @@ class BarrierDMSSolverTests(unittest.TestCase):
             goal_state=np.array([1.9, 0.5, 0.0]),
         )
         self.assertTrue(result.success)
-        expected = (
-            result.min_safety_margin
-            - cfg.delta_extra
-            - cfg.epsilon_certificate_buffer
-            - result.defect_norm
-        )
+        # min_slack is ALREADY hard-floored at delta_extra +
+        # epsilon_certificate_buffer by the NLP's slack lbx (Task 3) -- do
+        # NOT subtract that floor again here, that's exactly the bug that
+        # made certified_safety_margin collapse to ~ -defect_norm whenever
+        # the floor was binding (regression: 2026-06-17 default scenario).
+        expected = result.min_safety_margin - result.defect_norm
         self.assertAlmostEqual(result.certified_safety_margin, expected, places=9)
         self.assertEqual(result.safety_certification, "CERTIFIED")
+
+    def test_certified_margin_increases_when_floor_is_binding(self) -> None:
+        # Regression test for the certification formula bug: when the hard
+        # delta_extra/epsilon_certificate_buffer floor is the ACTIVE
+        # constraint (cost wants less clearance than the floor allows),
+        # raising the floor must actually raise certified_safety_margin --
+        # the old (buggy) formula always collapsed to ~ -defect_norm here,
+        # making the buffer knob useless exactly when it mattered most.
+        graph, dynamics = _two_region_setup()
+        anchor_points = np.array([[0.1, 0.5], [1.0, 0.5], [1.9, 0.5]])
+        kwargs = dict(
+            start_state=np.array([0.1, 0.5, 0.0]),
+            goal_state=np.array([1.9, 0.5, 0.0]),
+        )
+        cfg_low = BarrierDMSConfig(
+            n_int=40, barrier_levels=[1.0, 0.5, 0.1, 0.01], time_limit_s=30.0,
+            delta_extra=0.055,
+        )
+        cfg_high = BarrierDMSConfig(
+            n_int=40, barrier_levels=[1.0, 0.5, 0.1, 0.01], time_limit_s=30.0,
+            delta_extra=0.055, epsilon_certificate_buffer=0.005,
+        )
+        result_low = BarrierDMSSolver(graph, dynamics, cfg_low).solve(
+            [0, 1], anchor_points, **kwargs,
+        )
+        result_high = BarrierDMSSolver(graph, dynamics, cfg_high).solve(
+            [0, 1], anchor_points, **kwargs,
+        )
+        self.assertTrue(result_low.success)
+        self.assertTrue(result_high.success)
+        # Both floors exceed this fixture's unconstrained-optimal margin
+        # (~0.0487), so both are binding -- min_safety_margin tracks each
+        # floor almost exactly, and the HIGHER floor must certify with
+        # strictly more margin, not collapse to the same ~0 value.
+        self.assertGreater(
+            result_high.certified_safety_margin,
+            result_low.certified_safety_margin + 0.003,
+        )
 
 
 if __name__ == "__main__":

@@ -178,6 +178,7 @@ scenarios:
         delta_safe: 0.02
         barrier_levels: [0.05]
         mode: "first_feasible"
+        epsilon_certificate_buffer: 0.001
 
   maze:
     name: "Maze Environment"

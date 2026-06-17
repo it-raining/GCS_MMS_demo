@@ -161,12 +161,16 @@ class BarrierDMSSolver:
         best_result.defect_norm = defect_norm
         best_result.lipschitz_gap = lip_gap
         best_result.min_safety_margin = float(min_slack)
-        # Spec Sec 4: certified margin above the hard floor enforced live in
-        # the NLP (delta_extra + epsilon_certificate_buffer), corrected only
-        # for the hard-equality residual (defect_norm) at solver tolerance.
-        best_result.certified_safety_margin = float(
-            min_slack - cfg.delta_extra - cfg.epsilon_certificate_buffer - defect_norm
-        )
+        # min_slack is ALREADY hard-floored at delta_extra +
+        # epsilon_certificate_buffer by the NLP's slack lbx (Task 3) -- do
+        # NOT subtract that floor again here. Doing so previously made
+        # certified_safety_margin collapse to ~ -defect_norm whenever the
+        # floor was the active/binding constraint (the common case for any
+        # genuinely narrow corridor), making epsilon_certificate_buffer
+        # incapable of ever raising the certified margin. The only
+        # remaining correction is the hard-equality residual (defect_norm)
+        # at solver tolerance.
+        best_result.certified_safety_margin = float(min_slack - defect_norm)
         best_result.safety_certification = (
             "CERTIFIED" if best_result.certified_safety_margin > 0 else "NOT_CERTIFIED"
         )
