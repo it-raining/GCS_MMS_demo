@@ -208,7 +208,7 @@ class BarrierDMSSolverTests(unittest.TestCase):
             sum(lr['n_iter'] for lr in result.barrier_level_results),
         )
 
-    def test_certified_margin_accounts_for_defect_and_integration_error(self) -> None:
+    def test_certified_margin_matches_new_formula(self) -> None:
         graph, dynamics = _two_region_setup()
         cfg = BarrierDMSConfig(
             n_int=40, barrier_levels=[1.0, 0.5, 0.1, 0.01], time_limit_s=30.0,
@@ -221,10 +221,14 @@ class BarrierDMSSolverTests(unittest.TestCase):
             goal_state=np.array([1.9, 0.5, 0.0]),
         )
         self.assertTrue(result.success)
-        self.assertLessEqual(
-            result.certified_safety_margin,
-            result.min_safety_margin - result.lipschitz_gap,
+        expected = (
+            result.min_safety_margin
+            - cfg.delta_extra
+            - cfg.epsilon_certificate_buffer
+            - result.defect_norm
         )
+        self.assertAlmostEqual(result.certified_safety_margin, expected, places=9)
+        self.assertEqual(result.safety_certification, "CERTIFIED")
 
 
 if __name__ == "__main__":

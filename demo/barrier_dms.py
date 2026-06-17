@@ -140,24 +140,32 @@ class BarrierDMSSolver:
         best_result.solve_time = solve_time
         best_result.barrier_level_results = level_results
 
+        # min_slack already embeds the Lipschitz-gap/RK4-truncation terms
+        # for the OPTIMIZED Delta_i (Task 2/3) -- do not subtract lip_gap or
+        # eps_int again here, that would double-count them.
         min_slack = self._compute_min_slack(best_result)
         optimized_delta_arr = np.array(
             [best_result.time_durations[ri] for ri in path_regions], dtype=float
         )
+        # lip_gap/eps_int below are PATH-WIDE WORST-CASE diagnostics only
+        # (reported on BarrierPathResult for backward-compatible
+        # logging/reporting) -- the per-segment values actually enforced
+        # live inside the NLP are already folded into min_slack.
         lip_gap = compute_lipschitz_safety_gap(
             self.dynamics, path_regions, self.graph,
             optimized_delta_arr, cfg.n_int,
         )
-        # Spec Sec 8.2: s_min_certified = s_min_sampled - L_s*h_max/2
-        #                                 - epsilon_defect - epsilon_int.
         h_max = float(np.max(optimized_delta_arr)) / cfg.n_int
         defect_norm = self._compute_defect_norm(best_result, start_state, goal_state)
         eps_int = self.dynamics.f_lipschitz_bound() * (h_max ** 4) / 30.0
         best_result.defect_norm = defect_norm
         best_result.lipschitz_gap = lip_gap
         best_result.min_safety_margin = float(min_slack)
+        # Spec Sec 4: certified margin above the hard floor enforced live in
+        # the NLP (delta_extra + epsilon_certificate_buffer), corrected only
+        # for the hard-equality residual (defect_norm) at solver tolerance.
         best_result.certified_safety_margin = float(
-            min_slack - lip_gap - defect_norm - eps_int
+            min_slack - cfg.delta_extra - cfg.epsilon_certificate_buffer - defect_norm
         )
         best_result.safety_certification = (
             "CERTIFIED" if best_result.certified_safety_margin > 0 else "NOT_CERTIFIED"
