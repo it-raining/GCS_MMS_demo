@@ -1,282 +1,241 @@
 # GCS-MMS Demo
 
-This demo solves motion planning problems using two main approaches:
+This demo solves motion planning on a graph of safe convex regions using
+**Centroid-Refine-DMS (CRD)**, the primary solver (`optimizer.solver_mode:
+"centroid_refine_dms"` in `config.yaml`). Legacy single-phase
+integrated-relaxation (`IntegratedNLPSolver`) and two-stage solver modes have
+been removed; CRD is the only supported pipeline.
 
-1.  **Integrated MIOCP:** A single-phase Mixed-Integer Optimal Control Problem formulation that simultaneously finds a path and a trajectory. It uses `IPOPT` for the continuous relaxation.
-2.  **Centroid-Refine-DMS (CRD):** A multi-stage solver that combines graph search, geometric refinement, and Direct Multiple Shooting (DMS). This approach is designed for robustness and can handle complex scenarios with safety certification.
+CRD runs five stages per candidate path:
 
-The key features include:
+- **A. Graph search** — Yen's k-shortest paths over the region graph, ranked
+  by a heuristic that rewards interface clearance and penalizes heading change.
+- **B. Interface QP** — places interface waypoints with a guaranteed
+  `delta_safe + delta_extra` clearance from region boundaries.
+- **C. Centroid warm-start** — builds a feasible initial guess for the
+  multiple-shooting NLP from the QP waypoints.
+- **D-E. Barrier DMS** — solves a log-barrier multiple-shooting NLP with a
+  decreasing `barrier_levels` continuation schedule, certifying the safety
+  margin of the final trajectory.
 
--   Multiple shooting for trajectory optimization.
--   Safety certification using Control-Lyapunov functions (CTCS) and log-barrier methods.
--   Geometric refinement of interfaces between convex regions.
--   Visualization tools, including a shooting convergence animation.
+Math reference: `docs/superpowers/specs/2026-06-07-centroid-refine-dms-design.md`.
 
 ## Quick Start
 
 From the repository root:
 
 ```bash
-python3 -m venv demo/.venv
-source demo/.venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-python3 demo/main_demo.py --scenario simple
+cd demo
+python main_demo.py --scenario default
 ```
 
-To see available scenarios and presets:
+If you only want to inspect the available configs without solving anything:
 
 ```bash
-python3 demo/main_demo.py --list-scenarios
-python3 demo/main_demo.py --list-presets
+python main_demo.py --list-scenarios
+python main_demo.py --list-presets
 ```
 
 ## Structure
 
-The codebase is organized to separate concerns:
+- `problem_data.py`: geometry presets for each environment/problem
+- `config.yaml`: scenario list and parameter overrides
+- `app_config.py`: config loading and scenario resolution
+- `scenario_builder.py`: builds environment, regions, graph, dynamics, optimizer
+- `optimizer.py`: `CentroidRefineDMSSolver` (Stage A graph search + Stage E orchestration)
+- `geometric_refiner.py`: Stage B Interface QP
+- `barrier_dms.py`: Stage D-E barrier-method multiple shooting + safety certification
+- `warmstart.py`: Stage C centroid warm-start construction
+- `shooting_animation.py`: fixed-path NLP iteration recorder + convergence GIF
+- `reporting.py`: Markdown report generation for per-scenario/benchmark results
+- `experiments.py`: scenario runner and result saving
+- `main_demo.py`: CLI entry point
 
--   `problem_data.py`: Geometry presets for different environments.
--   `config.yaml`: Scenario definitions and parameter overrides.
--   `app_config.py`: Configuration loading and scenario resolution.
--   `scenario_builder.py`: Assembles the environment, regions, graph, dynamics, and optimizer.
--   `optimizer.py`: Contains the integrated MIOCP solver (`IntegratedNLPSolver`) and the multi-stage `CentroidRefineDMSSolver`.
--   `geometric_refiner.py`: Implements the geometric refinement of interfaces.
--   `barrier_dms.py`: The Direct Multiple Shooting solver using a barrier method for safety.
--   `warmstart.py`: Generates initial guesses for the solvers.
--   `shooting_animation.py`: Tools to create convergence animations.
--   `experiments.py`: Scenario runner and result management.
--   `main_demo.py`: Command-line interface.
+## Running Tests
 
-## Running the Demo
+Tests use `pytest` and must run through the project's `.venv` interpreter
+(from the repository root):
 
-You can run different scenarios from the `demo` directory:
+```bash
+.venv/bin/python -m pytest tests/ -v
+```
+
+Quick subset while iterating on the safety-certification formula:
+
+```bash
+.venv/bin/python -m pytest tests/test_barrier_dms.py tests/test_centroid_refine_dms.py -v
+```
+
+The full default-scenario regression test is skipped by default because it
+runs a real solve (~tens of seconds). Opt in explicitly:
+
+```bash
+RUN_DEMO_REGRESSION=1 .venv/bin/python -m pytest tests/test_regression.py -v
+```
+
+Standalone debug/sanity scripts (not collected by pytest, run from `demo/`):
 
 ```bash
 cd demo
-# Run the default scenario
-python main_demo.py
-
-# Run a specific scenario
-python main_demo.py --scenario crd_demo
-
-# Visualize a scenario without running the optimization
-python main_demo.py --visualize-only --scenario medium
-
-# Run a quick test
-python main_demo.py --quick-test
+../.venv/bin/python test_crd_default.py   # end-to-end CRD run with verbose per-stage logging to /tmp/crd_debug.log
+../.venv/bin/python ctcs_self_test.py     # RK4 accumulated path-constraint violation sanity checks
 ```
 
-## Configuration
+## Run the Model (`main_demo.py`)
 
-Global parameters are defined in `config.yaml`. You can override them for specific scenarios.
+Run from `demo/`:
 
-### Shooting Parameters (`shooting`)
-
--   `safety_mode`: Controls how local region containment is enforced.
-    -   `mesh`: Enforces safety at discrete mesh points.
-    -   `ctcs`: Uses a continuous-time safety certificate (CTCS).
-    -   `both`: Enforces both.
-
-### Centroid-Refine-DMS (`centroid_refine_dms`)
-
-This block configures the `CentroidRefineDMSSolver`. Key parameters include:
-- `mode`: `first_feasible` or `best_k_paths`.
-- `use_log_barrier`: Whether to use the barrier method for safety.
-- `barrier_levels`: A schedule of barrier parameters (`delta_safe`).
-
-## New Features
-
-### Centroid-Refine-DMS Solver
-
-The `CentroidRefineDMSSolver` is a robust, multi-stage solver:
-1.  **Graph Search:** Finds k-shortest paths in the region graph.
-2.  **Interface Refinement:** Optimizes the location of interfaces between regions using `InterfaceQP`.
-3.  **Direct Multiple Shooting (DMS):** Solves the trajectory optimization problem for each path using `BarrierDMSSolver`.
-
-This solver is highly configurable and is the recommended approach for complex problems.
-
-### Barrier-DMS and Safety Certification
-
-The `BarrierDMSSolver` uses a log-barrier formulation to enforce safety constraints, ensuring the trajectory remains within the convex regions. It can certify the safety of the trajectory with a given tolerance.
-
-### Shooting Convergence Animation
-
-A new tool, `shooting_animation.py`, can generate GIFs that visualize the convergence of the multiple shooting algorithm. It shows how the disconnected trajectory segments are stitched together into a smooth, continuous path.
-
-To generate an animation, you can run a scenario with the appropriate configuration. The `test_shooting_animation.py` file contains examples.
-
-
-# Maze size knobs. The CTCS transcription can get expensive quickly on mazes
-# with many ACD regions, so begin small before trying larger values.
-MAZE_SIZE="${MAZE_SIZE:-3}"
-MAZE_COUNT="${MAZE_COUNT:-1}"
-MAZE_KNOCK_DOWNS="${MAZE_KNOCK_DOWNS:-0}"
-MAZE_SEED="${MAZE_SEED:-4}"
-MAZE_WALL_THICKNESS="${MAZE_WALL_THICKNESS:-0.08}"
-
-# Safety transcription:
-#   mesh: old finite mesh safety constraints
-#   ctcs: RK4 approximation of accumulated path-constraint violation
-#   both: mesh constraints plus CTCS certificate
-SAFETY_MODE="${SAFETY_MODE:-both}"
-N_INTEGRATION_STEPS="${N_INTEGRATION_STEPS:-5}"
-N_MESH_POINTS="${N_MESH_POINTS:-3}"
-SAFETY_MARGIN="${SAFETY_MARGIN:-0.02}"
-CTCS_TOLERANCE="${CTCS_TOLERANCE:-1.0e-5}"
-CTCS_ETA_BIG_M="${CTCS_ETA_BIG_M:-100.0}"
-DENSE_CHECK_POINTS="${DENSE_CHECK_POINTS:-100}"
-DENSE_CHECK_TOLERANCE="${DENSE_CHECK_TOLERANCE:-1.0e-4}"
-FAIL_ON_DENSE_VIOLATION="${FAIL_ON_DENSE_VIOLATION:-false}"
-
-# Dynamics/control and solver budget.
-N_CONTROL_SEGMENTS="${N_CONTROL_SEGMENTS:-2}"
-DELTA_MIN="${DELTA_MIN:-0.01}"
-DELTA_MAX="${DELTA_MAX:-10.0}"
-IPOPT_MAX_ITER="${IPOPT_MAX_ITER:-500}"
-IPOPT_TOL="${IPOPT_TOL:-1.0e-6}"
-IPOPT_PRINT_LEVEL="${IPOPT_PRINT_LEVEL:-0}"
-
-# Artifact switches. Disable images/GIFs while tuning solver settings.
-SAVE_PNG="${SAVE_PNG:-false}"
-SAVE_GIF="${SAVE_GIF:-false}"
-SAVE_JSON="${SAVE_JSON:-true}"
-
-# Keep the generated config inside demo/ so relative results_dir resolves to
-# demo/results instead of /tmp/results.
-CONFIG_PATH="${CONFIG_PATH:-ctcs_maze.local.yaml}"
-
-cat > "${CONFIG_PATH}" <<YAML
-problem:
-  default_preset: "maze"
-
-start_state:
-  position: [0.2, 0.2]
-  heading: 0.785
-
-goal_state:
-  position: [4.8, 4.8]
-  heading: 0.785
-
-dynamics:
-  model: "unicycle"
-  v_min: -2.0
-  v_max: 2.0
-  omega_min: -3.14159
-  omega_max: 3.14159
-  delta_min: ${DELTA_MIN}
-  delta_max: ${DELTA_MAX}
-
-control:
-  parameterization: "piecewise_constant"
-  n_segments: ${N_CONTROL_SEGMENTS}
-
-shooting:
-  n_integration_steps: ${N_INTEGRATION_STEPS}
-  n_mesh_points: ${N_MESH_POINTS}
-  safety_margin: ${SAFETY_MARGIN}
-  safety_mode: "${SAFETY_MODE}"
-  ctcs_tolerance: ${CTCS_TOLERANCE}
-  ctcs_penalty: "squared_hinge"
-  ctcs_use_rk4_stages: true
-  ctcs_eta_big_m: ${CTCS_ETA_BIG_M}
-  dense_check_points: ${DENSE_CHECK_POINTS}
-  dense_check_tolerance: ${DENSE_CHECK_TOLERANCE}
-  fail_on_dense_violation: ${FAIL_ON_DENSE_VIOLATION}
-
-cost:
-  a: 1.0
-  w_L: 1.0
-  w_E: 1.0
-  w_u_smooth: 0.2
-
-graph:
-  max_paths: 1500
-
-optimizer:
-  enforce_control_continuity: true
-  path_polish_candidates: 3
-  ipopt:
-    max_iter: ${IPOPT_MAX_ITER}
-    tol: ${IPOPT_TOL}
-    print_level: ${IPOPT_PRINT_LEVEL}
-  big_M:
-    position: 20.0
-    interface: 20.0
-    time: 100.0
-
-visualization:
-  figsize: [10, 10]
-  show_regions: true
-  show_graph: false
-  show_mesh_points: true
-  animation:
-    fps: 30
-    duration: 5.0
-
-scenarios:
-  maze:
-    name: "Generated Maze"
-    description: "Runtime-generated maze benchmark"
-    active_regions: "all"
-    problem_preset: "maze"
-
-output:
-  results_dir: "results"
-  save_png: ${SAVE_PNG}
-  save_gif: ${SAVE_GIF}
-  save_json: ${SAVE_JSON}
-  verbosity: 1
-YAML
-
-../.venv/bin/python main_demo.py \
-  --config "${CONFIG_PATH}" \
-  --maze-benchmark \
-  --maze-count "${MAZE_COUNT}" \
-  --maze-size "${MAZE_SIZE}" \
-  --maze-knock-downs "${MAZE_KNOCK_DOWNS}" \
-  --maze-seed "${MAZE_SEED}" \
-  --maze-wall-thickness "${MAZE_WALL_THICKNESS}" \
+```bash
+cd demo
+python main_demo.py \
+  --config config.yaml \
+  --scenario default \
   --quiet
 ```
 
-Examples:
+Other entry points, runnable as-is (copy/paste):
 
 ```bash
-# Fast CTCS sanity check on the smallest generated maze.
-bash run_ctcs_maze.sh
-
-# Baseline old behavior.
-SAFETY_MODE=mesh bash run_ctcs_maze.sh
-
-# Increase CTCS resolution after the small case runs.
-MAZE_SIZE=5 MAZE_KNOCK_DOWNS=3 N_INTEGRATION_STEPS=10 DENSE_CHECK_POINTS=300 bash run_ctcs_maze.sh
+python main_demo.py --list-scenarios
+python main_demo.py --list-presets
+python main_demo.py --formulation
+python main_demo.py --visualize-only --scenario default
+python main_demo.py --shooting-animation --scenario default
+python main_demo.py --quick-test --scenario default
+python main_demo.py --maze-benchmark \
+  --maze-count 5 --maze-size 25 --maze-knock-downs 25 \
+  --maze-seed 4 --maze-wall-thickness 0.08
 ```
 
-Speed tuning notes:
+### Argument reference
 
-- `dense_check_points` only changes post-solve verification cost. It does not reduce the IPOPT NLP size. Use `10` only for smoke tests; use `100-300` while tuning; use `500-1000` for final safety reporting.
-- `n_integration_steps` changes the RK4 dynamics and CTCS NLP size. Try `5` for fast debugging, `10` for medium runs, and `20+` for final runs.
-- `n_mesh_points` changes mesh safety constraints when `safety_mode` is `mesh` or `both`. Try `3-5` for speed and `10+` when checking final trajectories.
-- `safety_mode: "mesh"` is fastest, `"ctcs"` is usually heavier, and `"both"` is the most conservative and most expensive.
-- `dense_check_tolerance` should usually stay near `1.0e-4`. Lowering dense samples makes the check less reliable; it does not justify loosening the tolerance.
-- If `dense_check_points` is very small, set `fail_on_dense_violation: false` and treat `max_dense_region_violation` as a quick diagnostic, not a safety decision.
+| Argument | Default | Effect on result |
+| --- | --- | --- |
+| `--config PATH` | `config.yaml` | Selects the YAML file all other settings are resolved from. |
+| `--scenario NAME` | first scenario in config | Selects which `scenarios.<name>` block (geometry preset, start/goal, `overrides`) is solved. Omitting it with no other flag runs **all** scenarios. |
+| `--quick-test` | off | Runs one scenario through `ExperimentRunner` and returns the raw `OptimizationResult` — useful for a fast pipeline sanity check without saving plots. |
+| `--visualize-only` | off | Only renders the safe-region decomposition and region graph `G=(V,E)`; does not invoke the solver. |
+| `--shooting-animation` | off | Solves the scenario, extracts the path, replays the fixed-path NLP with an iteration recorder, and writes a convergence GIF. Slower than a normal solve because it re-solves the fixed path with recording enabled. |
+| `--formulation` | off | Prints the MIOCP/CRD formulation summary and exits; no solve. |
+| `--list-presets` | off | Lists geometry presets defined in `problem_data.py`; no solve. |
+| `--list-scenarios` | off | Lists scenario keys defined in `config.yaml`; no solve. |
+| `--maze-benchmark` | off | Generates `--maze-count` random mazes and benchmarks CRD on each instead of running a configured scenario. |
+| `--maze-count N` | `5` | Number of random maze instances to generate and solve. More instances give a more reliable success-rate/timing estimate but take longer overall. |
+| `--maze-size N` | `25` | Maze width/height in cells. Larger mazes produce more ACD regions and longer paths, increasing NLP size and solve time, and stress-testing Stage A path search. |
+| `--maze-knock-downs N` | `25` | Extra random interior wall removals after maze generation, widening some corridors and adding alternate routes. Higher values make the maze more open (fewer narrow-interface rejections in Stage B). |
+| `--maze-seed N` | `4` | Starting RNG seed; each of the `--maze-count` instances increments from this seed. Fixing it makes a benchmark run reproducible. |
+| `--maze-wall-thickness F` | `0.08` | Thickness of generated interior maze walls, in workspace units. Thicker walls shrink corridor width, making the `delta_safe`/`delta_extra` narrow-interface check (see below) reject more candidate paths. |
+| `--maze-debug-geometry` | off | Saves workspace + hole geometry plots before ACD, for inspecting maze generation independent of the solve. |
+| `--quiet` | off | Suppresses per-stage progress logging; does not change solver behavior or results. |
 
-Scenario-specific changes should go under `scenarios.<name>.overrides`:
+## Configure Parameters (`config.yaml`)
+
+```yaml
+region_decomposition:
+  overlap_width: 0.5      # must satisfy overlap_width >= delta_safe + delta_extra
+
+dynamics:
+  model: "unicycle"
+  delta_min: 0.1           # minimum dwell time per region [s]
+  delta_max: 3.0           # bounds h_max = delta_max / n_integration_steps
+
+control:
+  n_segments: 2             # piecewise-constant control segments per region
+
+shooting:
+  n_integration_steps: 10   # RK4 steps per region; also sets h_max above
+
+cost:
+  a: 1.0          # time penalty w_T
+  w_L: 1.0        # path-length penalty
+  w_E: 1.0        # control-effort penalty w_U
+  w_u_smooth: 0.5 # inter-segment control smoothness penalty w_S
+
+optimizer:
+  solver_mode: "centroid_refine_dms"
+  max_paths: 1500            # upper bound on path enumeration in summaries
+
+centroid_refine_dms:
+  gamma_w: 1.0                      # Stage A: interface-clearance bonus
+  gamma_h: 0.64                     # Stage A: heading-change penalty
+  delta_safe: 0.02                  # Stage B/D-E: required safety clearance
+  delta_extra: 0.01                 # hard floor added to the NLP safety slack
+  epsilon_certificate_buffer: 0.0   # extra certified-margin headroom (NLP floor + pass/fail threshold only)
+  alpha_s: 0.0                      # Stage B: QP smoothness weight
+  v_nom_fraction: 0.5                # Stage C: warm-start nominal speed fraction of v_max
+  barrier_levels: [1.0, 0.5, 0.1, 0.01]  # Stage D-E continuation schedule, large -> small mu
+  epsilon_final: 1.0e-6              # final IPOPT KKT tolerance
+  epsilon_gap: 0.05                  # near-optimality gap for "anytime" mode
+  mode: "anytime"                    # "first_feasible" | "anytime"
+```
+
+Parameter effects worth knowing before tuning:
+
+- `n_integration_steps` sets `h_max = delta_max / n_integration_steps`, which
+  drives the per-segment Lipschitz/RK4 safety margin baked into the barrier
+  NLP. Fewer steps means a larger required margin and tighter narrow-corridor
+  rejections in Stage B; more steps shrinks the margin but grows the NLP.
+- `delta_safe` and `delta_extra` gate **both** the Interface QP anchor
+  placement (Stage B) and the live per-segment safety constraint inside the
+  barrier NLP (Stage D-E). Raising either rejects more narrow interfaces but
+  also raises `certified_safety_margin` on paths that do solve.
+- `epsilon_certificate_buffer` only raises the NLP's safety-slack floor and
+  the `certified_safety_margin` pass/fail threshold — it does not change
+  Interface QP or path-search behavior. Use it to add headroom when a
+  scenario reports `NOT_CERTIFIED` with a thin margin, without re-tuning
+  `delta_safe`/`delta_extra` everywhere else.
+- `barrier_levels` is the mu continuation schedule for the log-barrier NLP
+  (Stage D-E): more/finer levels improve convergence robustness at the cost
+  of more NLP solves per candidate path.
+- `mode: "first_feasible"` stops at the first candidate path that solves and
+  certifies; `mode: "anytime"` keeps searching until `epsilon_gap` or
+  `time_limit_s` is hit, trading solve time for a better-cost guarantee.
+
+Scenario-specific changes go under `scenarios.<name>.overrides`, deep-merged
+onto the global defaults above:
 
 ```yaml
 scenarios:
-  high_resolution:
-    name: "High Resolution"
-    description: "All regions with increased mesh points"
-    active_regions: "all"
+  default:
+    problem_preset: "default"
     overrides:
+      control:
+        n_segments: 4
       shooting:
-        n_mesh_points: 15
-      optimizer:
-        ipopt:
-          max_iter: 5000
+        n_integration_steps: 44
+      centroid_refine_dms:
+        delta_safe: 0.02
+        barrier_levels: [0.05]
+        mode: "first_feasible"
+        epsilon_certificate_buffer: 0.001
 ```
 
-You can also override `start_state`, `goal_state`, and `problem_preset` per scenario.
+You can also override `start_state`, `goal_state`, and `problem_preset` per
+scenario. CRD-relevant override keys:
+
+- `overrides.centroid_refine_dms.*` — solver hyperparameters
+- `overrides.control.n_segments` — piecewise-constant segments
+- `overrides.shooting.n_integration_steps` — RK4 steps (affects Lipschitz gap)
+- `overrides.dynamics.delta_max` — max dwell time per region
+- `overrides.cost.*` — cost weights
+- `overrides.region_decomposition.overlap_width`
+
+## Maze Benchmark Notes
+
+Dense mazes have small regions and narrow interfaces, so the global
+`delta_safe`/`delta_max` defaults can reject almost every candidate path (see
+the `maze` scenario's `overrides` comments in `config.yaml` for the worked
+example). When tuning a maze scenario:
+
+- Shrink `dynamics.delta_max` (keep `n_integration_steps` fixed) to bring
+  `h_max` down without growing the NLP.
+- Raise `centroid_refine_dms.gamma_w` if Stage A keeps ranking narrow,
+  cheap-looking corridors above a wider but longer route.
+- Use `--maze-debug-geometry` to inspect generated geometry independently of
+  the solve.
 
 ## Add a New Environment
 
@@ -308,9 +267,16 @@ That is enough for the CLI and experiment runner to pick it up.
 
 ## Outputs
 
-Results are saved under `results/`:
+Results are saved under `results/` (or `output.results_dir` in
+`config.yaml`):
 
 - `{scenario}_result.png`
 - `{scenario}_animation.gif`
 - `{scenario}_summary.json`
 - `benchmark_summary.json`
+
+Markdown reports (`reporting.py`) are written under `output.docs_dir`
+(default `docs/`) when `output.save_md` is true:
+
+- `demo/docs/default_report.md`
+- `demo/docs/benchmark_summary.md`
