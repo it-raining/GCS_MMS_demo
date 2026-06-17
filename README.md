@@ -1,16 +1,16 @@
 # GCS-MMS Demo
 
-This demo solves motion planning as a single integrated one-phase MIOCP relaxation:
+This demo solves motion planning problems using two main approaches:
 
-- graph flow variables `y_uv`, `p_v`
-- multiple-shooting trajectory variables `s_v^-`, `s_v^+`, `w_v`, `Delta_v`
-- interface variables `z_uv`
-- local cost epigraphs `rho_v`
+1.  **Integrated MIOCP:** A single-phase Mixed-Integer Optimal Control Problem formulation that simultaneously finds a path and a trajectory. It uses `IPOPT` for the continuous relaxation.
+2.  **Centroid-Refine-DMS (CRD):** A multi-stage solver that combines graph search, geometric refinement, and Direct Multiple Shooting (DMS). This approach is designed for robustness and can handle complex scenarios with safety certification.
 
-The runtime solver is:
+The key features include:
 
-- `IPOPT` on the integrated continuous relaxation
-- optional fixed-path NLP polish when the extracted relaxed path is fractional or discontinuous
+-   Multiple shooting for trajectory optimization.
+-   Safety certification using Control-Lyapunov functions (CTCS) and log-barrier methods.
+-   Geometric refinement of interfaces between convex regions.
+-   Visualization tools, including a shooting convergence animation.
 
 ## Quick Start
 
@@ -23,7 +23,7 @@ pip install -r requirements.txt
 python3 demo/main_demo.py --scenario simple
 ```
 
-If you only want to inspect the available configs without activating the demo environment:
+To see available scenarios and presets:
 
 ```bash
 python3 demo/main_demo.py --list-scenarios
@@ -32,72 +32,78 @@ python3 demo/main_demo.py --list-presets
 
 ## Structure
 
-The code is organized so geometry, scenarios, and solver assembly are separate:
+The codebase is organized to separate concerns:
 
-- `problem_data.py`: geometry presets for each environment/problem
-- `config.yaml`: scenario list and parameter overrides
-- `app_config.py`: config loading and scenario resolution
-- `scenario_builder.py`: builds environment, regions, graph, dynamics, optimizer
-- `optimizer.py`: integrated solver and fixed-path polish
-- `experiments.py`: scenario runner and result saving
-- `main_demo.py`: CLI entry point
+-   `problem_data.py`: Geometry presets for different environments.
+-   `config.yaml`: Scenario definitions and parameter overrides.
+-   `app_config.py`: Configuration loading and scenario resolution.
+-   `scenario_builder.py`: Assembles the environment, regions, graph, dynamics, and optimizer.
+-   `optimizer.py`: Contains the integrated MIOCP solver (`IntegratedNLPSolver`) and the multi-stage `CentroidRefineDMSSolver`.
+-   `geometric_refiner.py`: Implements the geometric refinement of interfaces.
+-   `barrier_dms.py`: The Direct Multiple Shooting solver using a barrier method for safety.
+-   `warmstart.py`: Generates initial guesses for the solvers.
+-   `shooting_animation.py`: Tools to create convergence animations.
+-   `experiments.py`: Scenario runner and result management.
+-   `main_demo.py`: Command-line interface.
 
-## Run
+## Running the Demo
+
+You can run different scenarios from the `demo` directory:
 
 ```bash
 cd demo
+# Run the default scenario
 python main_demo.py
-python main_demo.py --scenario simple
-python main_demo.py --list-scenarios
-python main_demo.py --list-presets
+
+# Run a specific scenario
+python main_demo.py --scenario crd_demo
+
+# Visualize a scenario without running the optimization
 python main_demo.py --visualize-only --scenario medium
+
+# Run a quick test
 python main_demo.py --quick-test
 ```
 
-## Configure Parameters
+## Configuration
 
-Global defaults live in `config.yaml`:
+Global parameters are defined in `config.yaml`. You can override them for specific scenarios.
 
-```yaml
-cost:
-  a: 1.0
-  w_L: 1.0
-  w_E: 1.0
+### Shooting Parameters (`shooting`)
 
-shooting:
-  n_integration_steps: 20
-  n_mesh_points: 10
-  safety_margin: 0.02
-  safety_mode: "both"
-  ctcs_tolerance: 1.0e-6
-  dense_check_points: 1000
-  dense_check_tolerance: 1.0e-4
-  fail_on_dense_violation: true
+-   `safety_mode`: Controls how local region containment is enforced.
+    -   `mesh`: Enforces safety at discrete mesh points.
+    -   `ctcs`: Uses a continuous-time safety certificate (CTCS).
+    -   `both`: Enforces both.
 
-optimizer:
-  ipopt:
-    max_iter: 3000
-    tol: 1.0e-6
-    print_level: 0
-```
+### Centroid-Refine-DMS (`centroid_refine_dms`)
 
-`shooting.safety_mode` controls local region containment:
+This block configures the `CentroidRefineDMSSolver`. Key parameters include:
+- `mode`: `first_feasible` or `best_k_paths`.
+- `use_log_barrier`: Whether to use the barrier method for safety.
+- `barrier_levels`: A schedule of barrier parameters (`delta_safe`).
 
-- `mesh`: enforce `A*pi(x(tau_k)) <= b - safety_margin` at finite interior mesh points.
-- `ctcs`: enforce the CTCS safety certificate, an RK4 approximation of the accumulated nonnegative path-constraint violation.
-- `both`: enforce both transcriptions.
+## New Features
 
-The CTCS certificate uses `eta_end ~= integral sum_i [A_i*pi(x(tau)) - b_i + safety_margin]_+^2 dtau` and constrains `eta_end <= ctcs_tolerance`. This is not an exact continuous-time proof under finite RK4, so solved trajectories are also densely post-checked and the summary reports `max_ctcs_integral` and `max_dense_region_violation`.
+### Centroid-Refine-DMS Solver
 
-## Adjustable CTCS Maze Run
+The `CentroidRefineDMSSolver` is a robust, multi-stage solver:
+1.  **Graph Search:** Finds k-shortest paths in the region graph.
+2.  **Interface Refinement:** Optimizes the location of interfaces between regions using `InterfaceQP`.
+3.  **Direct Multiple Shooting (DMS):** Solves the trajectory optimization problem for each path using `BarrierDMSSolver`.
 
-For CTCS experiments, start with a small generated maze and scale up gradually. This script writes a temporary config and runs one maze benchmark case; edit the shell variables at the top to trade safety resolution against solve time.
+This solver is highly configurable and is the recommended approach for complex problems.
 
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
+### Barrier-DMS and Safety Certification
 
-cd "$(dirname "$0")/demo"
+The `BarrierDMSSolver` uses a log-barrier formulation to enforce safety constraints, ensuring the trajectory remains within the convex regions. It can certify the safety of the trajectory with a given tolerance.
+
+### Shooting Convergence Animation
+
+A new tool, `shooting_animation.py`, can generate GIFs that visualize the convergence of the multiple shooting algorithm. It shows how the disconnected trajectory segments are stitched together into a smooth, continuous path.
+
+To generate an animation, you can run a scenario with the appropriate configuration. The `test_shooting_animation.py` file contains examples.
+
 
 # Maze size knobs. The CTCS transcription can get expensive quickly on mazes
 # with many ACD regions, so begin small before trying larger values.
