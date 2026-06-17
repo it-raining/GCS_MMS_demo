@@ -134,6 +134,7 @@ class CentroidRefineDMSConfig:
     gamma_h: float = 0.64
     delta_safe: float = 0.02
     delta_extra: float = 0.01
+    epsilon_certificate_buffer: float = 0.0
     alpha_s: float = 0.0
     v_nom_fraction: float = 0.5
     barrier_levels: List[float] = field(default_factory=lambda: [1.0, 0.5, 0.1, 0.01])
@@ -2782,6 +2783,7 @@ def create_integrated_optimizer_from_config(graph: RegionGraph,
             gamma_h=cr_cfg_dict.get('gamma_h', 0.64),
             delta_safe=cr_cfg_dict.get('delta_safe', 0.02),
             delta_extra=cr_cfg_dict.get('delta_extra', 0.01),
+            epsilon_certificate_buffer=cr_cfg_dict.get('epsilon_certificate_buffer', 0.0),
             alpha_s=cr_cfg_dict.get('alpha_s', 0.0),
             v_nom_fraction=cr_cfg_dict.get('v_nom_fraction', 0.5),
             barrier_levels=cr_cfg_dict.get('barrier_levels', [1.0, 0.5, 0.1, 0.01]),

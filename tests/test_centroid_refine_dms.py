@@ -36,6 +36,21 @@ class CentroidRefineDMSConfigTests(unittest.TestCase):
         self.assertTrue(cfg.use_interface_qp)
         self.assertTrue(cfg.use_log_barrier)
 
+    def test_epsilon_certificate_buffer_defaults_to_zero(self):
+        cfg = CentroidRefineDMSConfig()
+        self.assertEqual(cfg.epsilon_certificate_buffer, 0.0)
+
+    def test_epsilon_certificate_buffer_parsed_from_config_dict(self):
+        from optimizer import create_integrated_optimizer_from_config
+        graph, dynamics, _, _ = _make_two_region_scenario()
+        cfg_dict = {
+            'optimizer': {'solver_mode': 'centroid_refine_dms'},
+            'dynamics': {}, 'shooting': {}, 'cost': {}, 'control': {},
+            'centroid_refine_dms': {'epsilon_certificate_buffer': 0.003},
+        }
+        solver = create_integrated_optimizer_from_config(graph, dynamics, cfg_dict)
+        self.assertEqual(solver.config.epsilon_certificate_buffer, 0.003)
+
     def test_ablation_flags_exist(self):
         cfg = CentroidRefineDMSConfig(
             use_centroid_cost=False,

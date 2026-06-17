@@ -22,6 +22,7 @@ class BarrierDMSConfig:
     delta_min: float = 0.1
     delta_max: float = 10.0
     n_control_segments: int = 2
+    epsilon_certificate_buffer: float = 0.0
     mu_weight: float = 1.0
     w_T: float = 1.0
     w_L: float = 1.0

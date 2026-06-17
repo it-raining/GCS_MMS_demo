@@ -98,9 +98,18 @@ centroid_refine_dms:
   gamma_h: 0.64   # heading-change penalty (v_nom / omega_max ~= 2.0/pi)
 
   # Stage B -- Interface QP safety margins
-  # delta_safe is raised at runtime to: max(this, L_s * h_max/2 + epsilon_final)
   delta_safe: 0.02
+  # delta_extra is a HARD lower bound on the safety slack inside the
+  # barrier-DMS NLP (not just a warm-start sanity threshold): raising it
+  # directly raises the guaranteed certified_safety_margin. It also still
+  # affects Interface QP anchor-point clearance.
   delta_extra: 0.01
+  # Extra certified-margin headroom, added only to the NLP's safety-slack
+  # floor and the certified_safety_margin pass/fail threshold. Does NOT
+  # affect Interface QP/path-search behavior (unlike delta_safe/delta_extra).
+  # Raise this per-scenario if safety_certification reports NOT_CERTIFIED
+  # with a thin margin.
+  epsilon_certificate_buffer: 0.0
   alpha_s: 0.0    # QP smoothness weight (0 = pure shortest polyline)
 
   # Stage C -- warm-start nominal speed
@@ -162,12 +171,12 @@ scenarios:
     problem_preset: "default"
     overrides:
       control:
-        n_segments: 2
+        n_segments: 4
       shooting:
         n_integration_steps: 44
       centroid_refine_dms:
-        delta_safe: 0.03
-        barrier_levels: [0.1]
+        delta_safe: 0.02
+        barrier_levels: [0.05]
         mode: "first_feasible"
 
   maze:
@@ -216,6 +225,8 @@ scenarios:
 # -----------------------------------------------------------------------------
 output:
   results_dir: "results"
+  # Directory for Markdown reports (relative to repo root)
+  docs_dir: "docs"
   save_png: true
   save_gif: true
   save_json: true
