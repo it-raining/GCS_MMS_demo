@@ -77,6 +77,17 @@ class DemoConfig:
     def save_json(self) -> bool:
         return bool(self.raw.get("output", {}).get("save_json", True))
 
+    @property
+    def save_md(self) -> bool:
+        return bool(self.raw.get("output", {}).get("save_md", True))
+
+    @property
+    def docs_dir(self) -> str:
+        docs_dir = Path(self.raw.get("output", {}).get("docs_dir", "docs"))
+        if not docs_dir.is_absolute():
+            docs_dir = self.path.parent / docs_dir
+        return str(docs_dir)
+
     def list_scenarios(self) -> List[str]:
         """Return scenario keys in config order."""
         return list(self.raw.get("scenarios", {}).keys())

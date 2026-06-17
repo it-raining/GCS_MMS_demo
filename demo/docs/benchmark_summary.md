@@ -4,11 +4,11 @@
 
 | Scenario | Status | Regions | Edges | Paths | Cost | Solve Time (s) | Mode |
 |----------|--------|---------|-------|-------|------|----------------|------|
-| [maze](maze_report.md) | FAIL | 171 | 442 | 768 | N/A | 284.001 | `LEGACY_INTEGRATED_BIGM_RELAXAT...` |
+| [default](default_report.md) | OK | 15 | 51 | 532 | 58.3189 | 14.602 | `centroid_refine_dms` |
 
 ## Individual Reports
 
-- [maze report](maze_report.md)
+- [default report](default_report.md)
 
 ## Formulation Notes
 

@@ -5,10 +5,10 @@
 | Field | Value |
 |-------|-------|
 | Preset | `default` |
-| Description | Default map with hand-crafted convex safe regions |
+| Description | 5x5 workspace with 6 obstacles, ACD2D convex decomposition |
 | Number of regions | 15 |
-| Number of edges | 44 |
-| Candidate paths | 68 |
+| Number of edges | 51 |
+| Candidate paths | 532 |
 | Start state | `[0.2, 0.2, 0.785]` |
 | Goal state | `[4.8, 4.8, 0.785]` |
 
@@ -16,51 +16,51 @@
 
 | Field | Value |
 |-------|-------|
-| Mode | `LEGACY_INTEGRATED_BIGM_RELAXATION_IPOPT` |
-| Solver | IPOPT (via CasADi) — continuous relaxation of integrated MIOCP |
-| Problem class | Continuous relaxation of MIOCP (MINLP after DMS transcription). **Not** a MICP/MISOCP. Nonconvex due to unicycle dynamics. |
-| Global optimality claim | No global certificate; IPOPT continuous relaxation of MIOCP. |
+| Mode | `centroid_refine_dms` |
+| Solver | IPOPT (via CasADi) |
+| Problem class | Nonlinear program (NLP). Nonconvex due to unicycle dynamics. |
+| Global optimality claim | LB is a geometric lower bound on the time component only. gap_k is NOT a certificate for the full DMS objective. No global optimality claim is made. The reported solution is a KKT point of the fixed-path barrier-augmented NLP under LICQ + SOSC. |
 
 ## 3. Selected Path
 
 | Field | Value |
 |-------|-------|
-| Path nodes | `source → R9 → R13 → R4 → R7 → R6 → R10 → R11 → R0 → target` |
-| Path regions | `[9, 13, 4, 7, 6, 10, 11, 0]` |
-| Path length (regions) | 8 |
+| Path nodes | `source → R9 → R13 → R14 → R4 → R7 → R6 → R10 → R11 → R0 → target` |
+| Path regions | `[9, 13, 14, 4, 7, 6, 10, 11, 0]` |
+| Path length (regions) | 9 |
 
 ## 4. Objective and Timing
 
 | Metric | Value |
 |--------|-------|
-| Total cost | 48.9455 |
-| Total duration | 25.6704 s |
-| Setup time | 0.3156 s |
-| Solve time | 15.0511 s |
-| Paths evaluated | 1 |
+| Total cost | 58.3189 |
+| Total duration | 17.4311 s |
+| Setup time | 0.2205 s |
+| Solve time | 14.6019 s |
+| Paths evaluated | 17 |
 
 ## 5. Feasibility Diagnostics
 
 | Metric | Value |
 |--------|-------|
-| Defect norm | 0.00e+00 |
-| Max connection gap | 1.13e-10 |
+| Defect norm | 5.58e-07 |
+| Max connection gap | 5.89e-07 |
 | Max control jump | 0.00e+00 |
-| Constraint violation | 4.18e-09 |
-| Max integrality gap | 4.45e-01 |
-| Min safety margin | N/A |
+| Constraint violation | 0.00e+00 |
+| Max integrality gap | 0.00e+00 |
+| Min safety margin | 1.10e-02 |
 | Path length metric | N/A |
 
 ## 6. Big-M / Perspective Status
 
 | Constraint type | Status |
 |-----------------|--------|
-| Region activation | **Big-M** — `|s| ≤ M·p`, `|w| ≤ M·p`, `Δ ≤ Δmax·p` force state/control/time to zero for inactive regions |
-| Region containment | **Big-M** — `A q − b ≤ M(1−p)` guards endpoint and mesh safety |
-| Edge/interface containment | **Big-M** — `A z_pos − b ≤ M(1−y)` guards interface point in intersection |
-| Interface equality | **Big-M** — `s⁺[u] − z ≤ M(1−y)` and `s⁻[v] − z ≤ M(1−y)` for edge continuity |
-| DMS defect | **No Big-M** — defect `s⁺ = F_endpoint(s⁻, w, Δ)` applied unconditionally; trivially satisfied for inactive regions (activation forces all vars to zero) |
-| Control continuity | **Big-M** — `|u_exit − u_entry| ≤ M(1−y)` when `enforce_control_continuity=True` |
+| Region activation | N/A |
+| Region containment | N/A |
+| Edge/interface containment | N/A |
+| Interface equality | N/A |
+| DMS defect | N/A |
+| Control continuity | N/A |
 
 ## 7. Nonconvexity Notes
 
