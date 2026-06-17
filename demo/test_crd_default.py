@@ -128,13 +128,12 @@ def _patch_crd_solver():
     OrigBuildLevel = _bdms.BarrierDMSSolver._solve_barrier_level
 
     def patched_build_level(self, path_regions, anchor_points, warm_start,
-                             delta_safe, mu, x_init, tol, **kwargs):
+                             mu, x_init, tol, **kwargs):
         log.debug(f"    _solve_barrier_level mu={mu:.4f}, tol={tol:.2e}, "
-                  f"delta_safe={delta_safe:.4f}, "
                   f"warm={'from_prev' if x_init is not None else 'default'}")
         t0 = time.time()
         result, x_opt = OrigBuildLevel(self, path_regions, anchor_points, warm_start,
-                                        delta_safe, mu, x_init, tol, **kwargs)
+                                        mu, x_init, tol, **kwargs)
         elapsed = time.time() - t0
         log.debug(f"    Level done: success={result.success}, "
                   f"status={result.solver_status!r}, time={elapsed:.3f}s, "
