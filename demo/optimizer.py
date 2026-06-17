@@ -2620,37 +2620,29 @@ class CentroidRefineDMSSolver:
                     graph=self.graph, path_regions=path_regions, anchor_points=z,
                     dynamics=self.dynamics, config=ws_cfg,
                 )
-                delta_safe_barrier = cfg.delta_safe
-                for _ in range(4):
-                    # Clamp to delta_max: the NLP variable bound (Part 2.4)
-                    # means Delta_i can never exceed delta_max once solved (see
-                    # the x0 clamp a few lines below), so the safety-gap
-                    # pre-check (R13/Part 8.2's h_max) must use the same bound
-                    # -- not the raw, unclamped warm-start estimate, which can
-                    # be arbitrarily large for elongated regions (Part 4.1
-                    # defines Delta_i^0 with no upper clamp) and would
-                    # otherwise inflate delta_safe far past what the solve
-                    # will actually need.
-                    delta_arr = np.array(
-                        [warm_start[ri]['delta'] for ri in path_regions], dtype=float
-                    )
-                    delta_arr = np.minimum(delta_arr, cfg.delta_max)
-                    lip_gap = compute_lipschitz_safety_gap(
-                        self.dynamics, path_regions, self.graph, delta_arr, cfg.n_int
-                    )
-                    required_delta_safe = max(
-                        cfg.delta_safe, lip_gap + cfg.epsilon_final
-                    )
-                    if (
-                        not cfg.use_interface_qp
-                        or required_delta_safe <= delta_safe_barrier + 1e-9
-                    ):
-                        delta_safe_barrier = required_delta_safe
-                        break
-
-                    delta_safe_barrier = required_delta_safe
+                # Single-pass warm-start clearance estimate (spec Sec 5):
+                # this only sizes the Interface QP anchor-point placement so
+                # the warm start passes the R3 strict-interior check and
+                # gives IPOPT a reasonable first iterate. It is NOT
+                # load-bearing for safety correctness anymore -- the live
+                # per-segment margin inside BarrierDMSSolver (Task 3) is
+                # what actually guarantees the certified safety margin,
+                # regardless of how good this estimate is.
+                delta_arr = np.array(
+                    [warm_start[ri]['delta'] for ri in path_regions], dtype=float
+                )
+                delta_arr = np.minimum(delta_arr, cfg.delta_max)
+                lip_gap = compute_lipschitz_safety_gap(
+                    self.dynamics, path_regions, self.graph, delta_arr, cfg.n_int
+                )
+                h_max = float(np.max(delta_arr)) / cfg.n_int
+                eps_int = self.dynamics.f_lipschitz_bound() * (h_max ** 4) / 30.0
+                required_delta_safe = max(
+                    cfg.delta_safe, lip_gap + eps_int + cfg.epsilon_final
+                )
+                if cfg.use_interface_qp and required_delta_safe > cfg.delta_safe + 1e-9:
                     barrier_qp_cfg = InterfaceQPConfig(
-                        delta_safe=delta_safe_barrier,
+                        delta_safe=required_delta_safe,
                         delta_extra=cfg.delta_extra,
                         lambda_s=cfg.alpha_s,
                     )
@@ -2668,8 +2660,15 @@ class CentroidRefineDMSSolver:
                 failure_log.append({'path': path, 'stage': 'C', 'reason': str(e)})
                 continue
 
+            # IMPORTANT: delta_safe here is the RAW config value, not the
+            # warm-start-inflated required_delta_safe estimate above. The
+            # live per-segment margin inside BarrierDMSSolver already adds
+            # the Lipschitz-gap/RK4-truncation terms on top of this base
+            # using the NLP's own Delta_i -- reusing the inflated estimate
+            # here would double-count those terms.
             barrier_cfg = BarrierDMSConfig(
-                n_int=cfg.n_int, delta_safe=delta_safe_barrier, delta_extra=cfg.delta_extra,
+                n_int=cfg.n_int, delta_safe=cfg.delta_safe, delta_extra=cfg.delta_extra,
+                epsilon_certificate_buffer=cfg.epsilon_certificate_buffer,
                 barrier_levels=cfg.barrier_levels if cfg.use_barrier_continuation else [cfg.barrier_levels[-1]],
                 epsilon_final=cfg.epsilon_final,
                 time_limit_s=max(1.0, cfg.time_limit_s - (_time.time() - start_clock)),

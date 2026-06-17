@@ -123,6 +123,38 @@ class CentroidRefineDMSSolverTests(unittest.TestCase):
                     atol=1e-8,
                 )
 
+    def test_barrier_nlp_uses_raw_delta_safe_not_inflated_estimate(self):
+        # Regression test: BarrierDMSConfig.delta_safe passed to the NLP
+        # must be the raw config value, not the warm-start-inflated
+        # delta_safe_barrier estimate computed for Interface QP placement
+        # (that estimate already gets re-added live inside the NLP per
+        # Delta_i, so reusing it as the NLP's base would double-count it).
+        import optimizer as _opt
+        import barrier_dms as _bdms
+        graph, dynamics, x_start, x_goal = _make_two_region_scenario()
+        cfg = CentroidRefineDMSConfig(n_int=8, epsilon_final=1e-3, delta_safe=0.02)
+        solver = _opt.CentroidRefineDMSSolver(graph, dynamics, cfg)
+
+        seen_delta_safe = []
+        OrigBarrierDMSConfig = _bdms.BarrierDMSConfig
+
+        def _spy(*args, **kwargs):
+            seen_delta_safe.append(kwargs.get('delta_safe'))
+            return OrigBarrierDMSConfig(*args, **kwargs)
+
+        # solve() does `from barrier_dms import BarrierDMSConfig` locally on
+        # each call, so the patch target is the barrier_dms module attribute,
+        # not optimizer's (optimizer has no module-level BarrierDMSConfig name).
+        _bdms.BarrierDMSConfig = _spy
+        try:
+            solver.solve(x_start, x_goal)
+        finally:
+            _bdms.BarrierDMSConfig = OrigBarrierDMSConfig
+
+        self.assertTrue(seen_delta_safe)
+        for value in seen_delta_safe:
+            self.assertEqual(value, cfg.delta_safe)
+
     def test_failure_log_is_list(self):
         graph, dynamics, x_start, x_goal = _make_two_region_scenario()
         cfg = CentroidRefineDMSConfig(n_int=5, epsilon_final=1e-3)
