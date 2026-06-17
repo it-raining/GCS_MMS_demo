@@ -61,20 +61,23 @@ class BarrierDMSSolverTests(unittest.TestCase):
         result = solver.solve([0, 1], anchor_points)
         self.assertGreater(len(result.barrier_level_results), 0)
 
-    def test_compute_min_slack_subtracts_delta_safe(self) -> None:
+    def test_compute_min_slack_scales_with_configured_delta_safe(self) -> None:
         graph, dynamics = _two_region_setup()
-        cfg = BarrierDMSConfig(n_int=5, barrier_levels=[1.0])
-        solver = BarrierDMSSolver(graph, dynamics, cfg)
         result = BarrierPathResult(
             success=True, path_regions=[0], total_cost=0.0, solve_time=0.0,
             solver_status="ok",
             entry_states={0: np.array([0.5, 0.5, 0.0])},
-            control_params={0: np.zeros(dynamics.n_u * solver.control_param.n_segments)},
+            control_params={0: np.zeros(dynamics.n_u * 2)},
             time_durations={0: 1.0},
         )
-        slack_with_margin = solver._compute_min_slack(result, delta_safe=0.05)
-        slack_without_margin = solver._compute_min_slack(result, delta_safe=0.0)
-        self.assertAlmostEqual(slack_without_margin - slack_with_margin, 0.05, places=9)
+        cfg_low = BarrierDMSConfig(n_int=5, barrier_levels=[1.0], delta_safe=0.0)
+        cfg_high = BarrierDMSConfig(n_int=5, barrier_levels=[1.0], delta_safe=0.05)
+        slack_low = BarrierDMSSolver(graph, dynamics, cfg_low)._compute_min_slack(result)
+        slack_high = BarrierDMSSolver(graph, dynamics, cfg_high)._compute_min_slack(result)
+        # Only cfg.delta_safe differs between the two configs; L_s and eps_int
+        # depend on dynamics/path/Delta_i, which are identical, so the gap
+        # between the two slacks must equal exactly the delta_safe gap.
+        self.assertAlmostEqual(slack_low - slack_high, 0.05, places=9)
 
     def test_solved_segments_populate_exit_states(self) -> None:
         graph, dynamics = _two_region_setup()

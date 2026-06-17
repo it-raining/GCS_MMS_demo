@@ -141,7 +141,7 @@ class BarrierDMSSolver:
         best_result.solve_time = solve_time
         best_result.barrier_level_results = level_results
 
-        min_slack = self._compute_min_slack(best_result, delta_safe)
+        min_slack = self._compute_min_slack(best_result)
         optimized_delta_arr = np.array(
             [best_result.time_durations[ri] for ri in path_regions], dtype=float
         )
@@ -480,7 +480,22 @@ class BarrierDMSSolver:
 
         return result, x_opt
 
-    def _compute_min_slack(self, result: BarrierPathResult, delta_safe: float) -> float:
+    def _compute_min_slack(self, result: BarrierPathResult) -> float:
+        """
+        Sampled safety margin at the optimized solution, using the SAME
+        per-segment margin formula enforced live inside the NLP (spec
+        2026-06-17-crd-certificate-margin-relaxation-design.md Sec 1/4):
+        margin_i = delta_safe + L_s * h_i/2 + f_lip * h_i**4/30, with
+        h_i = Delta_i / n_int computed from the OPTIMIZED Delta_i, not a
+        pre-solve estimate.
+        """
+        cfg = self.config
+        if not result.path_regions:
+            return float('nan')
+        A_list = [self.graph._regions_by_index[ri].A for ri in result.path_regions]
+        L_s = self.dynamics.compute_lipschitz_bound(A_list)
+        f_lip = self.dynamics.f_lipschitz_bound()
+
         min_slack = float('inf')
         for seg_idx, region_idx in enumerate(result.path_regions):
             if (
@@ -493,14 +508,15 @@ class BarrierDMSSolver:
             x_k = np.asarray(result.entry_states[region_idx], dtype=float).copy()
             w = np.asarray(result.control_params[region_idx], dtype=float)
             delta = float(result.time_durations[region_idx])
-            dt = 1.0 / self.config.n_int
+            dt = 1.0 / cfg.n_int
+            h_i = delta / cfg.n_int
+            margin = cfg.delta_safe + L_s * h_i / 2.0 + f_lip * (h_i ** 4) / 30.0
 
-            for k in range(self.config.n_int + 1):
+            for k in range(cfg.n_int + 1):
                 pos = self.dynamics.project_to_position(x_k)
-                # Spec Sec 2.1/8.1: s_ijk = b - delta_safe - A @ pos.
-                slacks = region.b - delta_safe - region.A @ pos
+                slacks = region.b - margin - region.A @ pos
                 min_slack = min(min_slack, float(np.min(slacks)))
-                if k == self.config.n_int:
+                if k == cfg.n_int:
                     break
 
                 tau = k * dt
