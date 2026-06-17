@@ -111,7 +111,6 @@ class BarrierDMSSolver:
                     path_regions=path_regions,
                     anchor_points=anchor_points,
                     warm_start=warm_start,
-                    delta_safe=delta_safe,
                     mu=mu,
                     x_init=x_init,
                     tol=tol,
@@ -214,7 +213,7 @@ class BarrierDMSSolver:
                   min_slack, self.config.delta_extra)
 
     def _build_nlp_symbols(
-        self, path_regions, anchor_points, delta_safe, mu,
+        self, path_regions, anchor_points, mu,
         start_state=None, goal_state=None, node_delta_safe=None,
     ):
         m = len(path_regions)
@@ -222,6 +221,9 @@ class BarrierDMSSolver:
         n_w = self.control_param.n_w
         cfg = self.config
         dt = 1.0 / cfg.n_int
+        A_list = [self.graph._regions_by_index[ri].A for ri in path_regions]
+        L_s = self.dynamics.compute_lipschitz_bound(A_list)
+        f_lip = self.dynamics.f_lipschitz_bound()
 
         all_verts = np.vstack([r.vertices for r in self.graph.regions])
         pos_lb = np.array([np.min(all_verts[:, 0]) - 1e-6, np.min(all_verts[:, 1]) - 1e-6])
@@ -373,12 +375,24 @@ class BarrierDMSSolver:
 
         for i, region_idx in enumerate(path_regions):
             region = self.graph._regions_by_index[region_idx]
+            delta_i = delta_vars[i]
+            # Live margin (spec Sec 1): grows with this segment's OWN
+            # optimized Delta_i, so the constraint the solver satisfies
+            # always matches the true post-hoc Lipschitz/RK4 requirement
+            # for whatever Delta_i it converges to -- no pre-solve estimate.
+            h_i = delta_i / cfg.n_int
+            margin_i = cfg.delta_safe + L_s * h_i / 2.0 + f_lip * (h_i ** 4) / 30.0
+            slack_floor = cfg.delta_extra + cfg.epsilon_certificate_buffer
+
             for k, x_k in enumerate(x_node_vars_list[i]):
                 slack = ca.MX.sym(
                     f'safety_slack_{i}_{k}', region.A.shape[0]
                 )
                 x_sym_list.append(slack)
-                lbx.extend([1e-10] * region.A.shape[0])
+                # Hard floor (spec Sec 2): guarantees certified_safety_margin
+                # >= delta_extra + epsilon_certificate_buffer - defect_norm
+                # for any successful solve, by construction.
+                lbx.extend([slack_floor] * region.A.shape[0])
                 ubx.extend([np.inf] * region.A.shape[0])
 
                 tau = k / cfg.n_int
@@ -390,19 +404,18 @@ class BarrierDMSSolver:
                     region.b - node_delta_safe[i, k]
                     - region.A @ warm_pos
                 )
-                x0_list.extend(np.maximum(warm_slack, cfg.delta_extra).tolist())
+                x0_list.extend(np.maximum(warm_slack, slack_floor).tolist())
 
                 pos_k = self.dynamics.project_to_position_casadi(x_k)
                 defined_slack = (
                     ca.DM(region.b)
-                    - float(node_delta_safe[i, k])
+                    - margin_i
                     - ca.mtimes(ca.DM(region.A), pos_k)
                 )
                 g_list.append(slack - defined_slack)
                 lbg.extend([0.0] * region.A.shape[0])
                 ubg.extend([0.0] * region.A.shape[0])
 
-                delta_i = delta_vars[i]
                 h_k = (
                     delta_i / (2.0 * cfg.n_int)
                     if k in (0, cfg.n_int)
@@ -420,12 +433,12 @@ class BarrierDMSSolver:
                 s_minus_vars, w_vars, delta_vars, x_node_vars_list)
 
     def _solve_barrier_level(self, path_regions, anchor_points, warm_start,
-                              delta_safe, mu, x_init, tol,
+                              mu, x_init, tol,
                               start_state=None, goal_state=None,
                               node_delta_safe=None):
         (x_sym, obj_base, barrier_term, g_sym, lbx, ubx, lbg, ubg,
          x0_default, s_minus_vars, w_vars, delta_vars, x_node_vars_list) = self._build_nlp_symbols(
-            path_regions, anchor_points, delta_safe, mu,
+            path_regions, anchor_points, mu,
             start_state=start_state, goal_state=goal_state,
             node_delta_safe=node_delta_safe,
         )

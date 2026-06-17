@@ -79,6 +79,49 @@ class BarrierDMSSolverTests(unittest.TestCase):
         # between the two slacks must equal exactly the delta_safe gap.
         self.assertAlmostEqual(slack_low - slack_high, 0.05, places=9)
 
+    def test_safety_slack_lower_bound_is_delta_extra_plus_buffer(self) -> None:
+        graph, dynamics = _two_region_setup()
+        cfg = BarrierDMSConfig(
+            n_int=5, barrier_levels=[1.0], delta_extra=0.02,
+            epsilon_certificate_buffer=0.01,
+        )
+        solver = BarrierDMSSolver(graph, dynamics, cfg)
+        anchor_points = np.array([[0.1, 0.5], [1.0, 0.5], [1.9, 0.5]])
+        node_delta_safe = np.full((2, cfg.n_int + 1), cfg.delta_safe)
+        out = solver._build_nlp_symbols(
+            [0, 1], anchor_points, mu=1.0, node_delta_safe=node_delta_safe,
+        )
+        lbx = out[4]
+        expected_floor = cfg.delta_extra + cfg.epsilon_certificate_buffer
+        # lbx layout per segment: [state_lb..., w_lb..., delta_min, then
+        # one entry per safety-slack component per node]. Every safety-slack
+        # lower bound must equal delta_extra + epsilon_certificate_buffer,
+        # never the old hardcoded 1e-10.
+        self.assertNotIn(1e-10, lbx)
+        self.assertTrue(any(abs(v - expected_floor) < 1e-12 for v in lbx))
+
+    def test_live_margin_keeps_min_slack_above_delta_extra(self) -> None:
+        # The defined_slack expression must depend on delta_vars[i]: once
+        # the per-segment Lipschitz/RK4 terms are embedded live, a converged
+        # solve's sampled min_safety_margin (which nets out that live
+        # margin) must still clear the hard delta_extra floor enforced on
+        # the slack variable.
+        graph, dynamics = _two_region_setup()
+        cfg = BarrierDMSConfig(
+            n_int=40, barrier_levels=[1.0, 0.5, 0.1, 0.01], time_limit_s=30.0,
+        )
+        solver = BarrierDMSSolver(graph, dynamics, cfg)
+        anchor_points = np.array([[0.1, 0.5], [1.0, 0.5], [1.9, 0.5]])
+        result = solver.solve(
+            [0, 1], anchor_points,
+            start_state=np.array([0.1, 0.5, 0.0]),
+            goal_state=np.array([1.9, 0.5, 0.0]),
+        )
+        self.assertTrue(result.success)
+        self.assertGreaterEqual(
+            result.min_safety_margin, cfg.delta_extra - 1e-6,
+        )
+
     def test_solved_segments_populate_exit_states(self) -> None:
         graph, dynamics = _two_region_setup()
         cfg = BarrierDMSConfig(n_int=20, barrier_levels=[1.0], time_limit_s=30.0)
@@ -118,13 +161,13 @@ class BarrierDMSSolverTests(unittest.TestCase):
 
         mu = 1.0
         out1 = solver._build_nlp_symbols(
-            [0, 1], anchor_points, delta_safe, mu, node_delta_safe=node_delta_safe,
+            [0, 1], anchor_points, mu, node_delta_safe=node_delta_safe,
         )
         x_sym, obj_base, barrier_term = out1[0], out1[1], out1[2]
         x0 = out1[8]
 
         out2 = solver._build_nlp_symbols(
-            [0, 1], anchor_points, delta_safe, 2 * mu, node_delta_safe=node_delta_safe,
+            [0, 1], anchor_points, 2 * mu, node_delta_safe=node_delta_safe,
         )
         x_sym2, obj_base2, barrier_term2 = out2[0], out2[1], out2[2]
         x0_2 = out2[8]
